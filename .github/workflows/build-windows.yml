@@ -14,10 +14,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Descargar el código
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Preparar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -59,7 +59,7 @@ jobs:
             -DestinationPath "dist/VideotecaYouTube-Windows.zip"
 
       - name: Guardar artefacto
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: VideotecaYouTube-Windows
           path: |

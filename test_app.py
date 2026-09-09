@@ -1,5 +1,6 @@
 import contextlib
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -231,6 +232,38 @@ class PortalFeatureTests(unittest.TestCase):
         self.assertTrue(victim.is_file())
         self.assertTrue(result["file_errors"])
 
+    @unittest.skipIf(os.name == 'nt', 'La variante Windows usa handles WinAPI.')
+    def test_delete_video_detects_root_replacement_between_validation_and_open(self):
+        category = app.create_category("Raíz sustituida")
+        video_id = "ROOTSWAP001"
+        app.add_video_urls(category["id"], video_id)
+        original_media = app.VIDEOS / "victim.mp4"
+        original_media.write_bytes(b"original")
+        replacement = Path(self.tmp.name) / "replacement-videos"
+        replacement.mkdir()
+        replacement_media = replacement / original_media.name
+        replacement_media.write_bytes(b"no borrar")
+        moved_original = Path(self.tmp.name) / "original-videos"
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (original_media.name, video_id))
+
+        real_open = os.open
+        swapped = False
+
+        def swapping_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and Path(path) == app.VIDEOS:
+                app.VIDEOS.rename(moved_original)
+                replacement.rename(app.VIDEOS)
+                swapped = True
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(app.os, 'open', side_effect=swapping_open):
+            result = app.delete_video(video_id, delete_local=True)
+        self.assertTrue(result['file_errors'])
+        self.assertTrue((app.VIDEOS / original_media.name).is_file())
+        self.assertTrue((moved_original / original_media.name).is_file())
+
     def test_delete_video_reports_cleanup_errors_after_removing_the_record(self):
         category = app.create_category("Error de disco")
         app.add_video_urls(category["id"], "dQw4w9WgXcQ")
@@ -289,6 +322,27 @@ class PortalFeatureTests(unittest.TestCase):
             membership = c.execute("SELECT count(*) FROM video_categories WHERE video_id=?", ("dQw4w9WgXcQ",)).fetchone()[0]
         self.assertEqual(row["name"], "Curso legado")
         self.assertEqual(membership, 1)
+
+    def test_init_migrates_a_legacy_schema_without_priority_or_category_tables(self):
+        app.DB.unlink()
+        with contextlib.closing(sqlite3.connect(app.DB)) as c, c:
+            c.execute('''CREATE TABLE videos(
+                video_id TEXT PRIMARY KEY, url TEXT NOT NULL, source TEXT,
+                title TEXT, filename TEXT, status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                duration REAL, filesize INTEGER
+            )''')
+            c.execute(
+                "INSERT INTO videos(video_id,url,source,title,status) VALUES(?,?,?,?,?)",
+                ('dQw4w9WgXcQ', 'https://youtu.be/dQw4w9WgXcQ', 'legado', 'Vídeo legado', 'done'),
+            )
+        app.init()
+        with app.con() as c:
+            columns = {row[1] for row in c.execute('PRAGMA table_info(videos)')}
+            memberships = c.execute('SELECT video_id,category_id FROM video_categories').fetchall()
+            self.assertIn('priority', columns)
+            self.assertEqual(len(memberships), 1)
+            self.assertEqual(c.execute('PRAGMA foreign_key_check').fetchall(), [])
 
     def test_frontend_exposes_management_forms_and_download_actions(self):
         category = app.create_category("Curso nuevo")

@@ -56,7 +56,6 @@ CREATE TABLE IF NOT EXISTS videos(
 );
 CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
 CREATE INDEX IF NOT EXISTS idx_videos_source ON videos(source);
-CREATE INDEX IF NOT EXISTS idx_videos_priority ON videos(priority DESC, title COLLATE NOCASE);
 CREATE TABLE IF NOT EXISTS categories(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -69,6 +68,7 @@ CREATE TABLE IF NOT EXISTS video_categories(
   PRIMARY KEY(video_id, category_id)
 );
 CREATE INDEX IF NOT EXISTS idx_video_categories_category ON video_categories(category_id, video_id);
+CREATE INDEX IF NOT EXISTS idx_videos_priority ON videos(priority DESC, title COLLATE NOCASE);
 """
 
 
@@ -290,21 +290,6 @@ def _safe_library_name(filename):
     return name
 
 
-def _verified_library_root(root):
-    root = Path(root)
-    absolute = Path(os.path.abspath(root))
-    info = os.lstat(absolute)
-    reparse_flag = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
-    if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & reparse_flag:
-        raise OSError('El directorio de la videoteca es un enlace o punto de reanálisis no permitido.')
-    resolved = absolute.resolve(strict=True)
-    if not absolute.is_dir():
-        raise OSError('El directorio de la videoteca no es una raíz segura.')
-    if os.name != 'nt' and os.path.normcase(str(resolved)) != os.path.normcase(str(absolute)):
-        raise OSError('El directorio de la videoteca no es una raíz segura.')
-    return absolute
-
-
 def _windows_unlink_from_root(root, name):
     import ctypes
     from ctypes import wintypes
@@ -325,6 +310,21 @@ def _windows_unlink_from_root(root, name):
     set_info = kernel32.SetFileInformationByHandle
     set_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
     set_info.restype = wintypes.BOOL
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ('attributes', wintypes.DWORD), ('creation_low', wintypes.DWORD),
+            ('creation_high', wintypes.DWORD), ('access_low', wintypes.DWORD),
+            ('access_high', wintypes.DWORD), ('write_low', wintypes.DWORD),
+            ('write_high', wintypes.DWORD), ('volume_serial', wintypes.DWORD),
+            ('size_high', wintypes.DWORD), ('size_low', wintypes.DWORD),
+            ('links', wintypes.DWORD), ('file_index_high', wintypes.DWORD),
+            ('file_index_low', wintypes.DWORD),
+        ]
+
+    get_info = kernel32.GetFileInformationByHandle
+    get_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
+    get_info.restype = wintypes.BOOL
 
     delete_access = 0x00010000
     read_attributes = 0x00000080
@@ -361,12 +361,22 @@ def _windows_unlink_from_root(root, name):
     if root_handle is None:
         raise OSError('El directorio de la videoteca no existe.')
     try:
+        root_info = ByHandleFileInformation()
+        if not get_info(root_handle, ctypes.byref(root_info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        directory_attribute = 0x10
+        reparse_attribute = 0x400
+        if not root_info.attributes & directory_attribute or root_info.attributes & reparse_attribute:
+            raise OSError('El directorio de la videoteca no es una raíz segura.')
         root_opened = opened_path(root_handle)
         file_handle = open_path(root / name, delete_access | read_attributes, open_reparse_point)
         if file_handle is None:
             return False
         try:
             file_opened = opened_path(file_handle)
+            root_still_opened = opened_path(root_handle)
+            if os.path.normcase(str(root_still_opened)) != os.path.normcase(str(root_opened)):
+                raise OSError('La raíz de la videoteca cambió durante el borrado.')
             if os.path.normcase(str(file_opened.parent)) != os.path.normcase(str(root_opened)):
                 raise OSError('El archivo local no pertenece a la raíz abierta de la videoteca.')
 
@@ -385,21 +395,20 @@ def _windows_unlink_from_root(root, name):
 
 def _unlink_library_file(root, filename):
     name = _safe_library_name(filename)
-    root = _verified_library_root(root)
+    root = Path(os.path.abspath(root))
     if os.name == 'nt':
         return _windows_unlink_from_root(root, name)
     if os.unlink not in os.supports_dir_fd:
-        try:
-            (root / name).unlink()
-            return True
-        except FileNotFoundError:
-            return False
+        raise OSError('El sistema no permite un borrado local seguro mediante descriptor de directorio.')
+    before = os.lstat(root)
+    reparse_flag = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
+    if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode) or getattr(before, 'st_file_attributes', 0) & reparse_flag:
+        raise OSError('El directorio de la videoteca no es una raíz segura.')
     flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
     directory_fd = os.open(root, flags)
     try:
         opened = os.fstat(directory_fd)
-        current = os.stat(root, follow_symlinks=False)
-        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             raise OSError('La raíz de la videoteca cambió durante el borrado.')
         try:
             os.unlink(name, dir_fd=directory_fd)

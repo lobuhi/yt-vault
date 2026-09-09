@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS categories(
   name TEXT NOT NULL COLLATE NOCASE UNIQUE,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS video_categories(
+  video_id TEXT NOT NULL REFERENCES videos(video_id) ON DELETE CASCADE,
+  category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(video_id, category_id)
+);
+CREATE INDEX IF NOT EXISTS idx_video_categories_category ON video_categories(category_id, video_id);
 """
 
 
@@ -73,6 +80,7 @@ def natural_key(value):
 def con():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
+    c.execute('PRAGMA foreign_keys=ON')
     c.execute('PRAGMA journal_mode=WAL')
     c.execute('PRAGMA busy_timeout=5000')
     try:
@@ -113,6 +121,8 @@ def init():
             c.execute('INSERT OR IGNORE INTO categories(name) VALUES(?)', (name,))
             category_id = c.execute('SELECT id FROM categories WHERE name=? COLLATE NOCASE', (name,)).fetchone()['id']
             c.execute('UPDATE videos SET category_id=? WHERE video_id=?', (category_id, video['video_id']))
+        c.execute('''INSERT OR IGNORE INTO video_categories(video_id, category_id)
+                     SELECT video_id, category_id FROM videos WHERE category_id IS NOT NULL''')
 
 
 def create_category(name):
@@ -220,11 +230,91 @@ def add_video_urls(category_id, raw_urls, playlist_loader=None):
             c.execute(
                 '''INSERT INTO videos(video_id,url,source,title,status,category_id)
                    VALUES(?,?,?,?,'remote',?)
-                   ON CONFLICT(video_id) DO UPDATE SET category_id=excluded.category_id,
-                     source=excluded.source, updated_at=CURRENT_TIMESTAMP''',
+                   ON CONFLICT(video_id) DO UPDATE SET
+                     source=COALESCE(videos.source, excluded.source), updated_at=CURRENT_TIMESTAMP''',
                 (video_id, url, category['name'], entry.get('title'), category_id),
             )
+            c.execute(
+                'INSERT OR IGNORE INTO video_categories(video_id, category_id) VALUES(?,?)',
+                (video_id, category_id),
+            )
     return {'added': len(video_ids) - len(existing_ids), 'existing': len(existing_ids), 'video_ids': video_ids}
+
+
+def video_category_ids(video_id):
+    with con() as c:
+        if not c.execute('SELECT 1 FROM videos WHERE video_id=?', (video_id,)).fetchone():
+            raise ValueError('El vídeo no existe.')
+        return [row['category_id'] for row in c.execute(
+            'SELECT category_id FROM video_categories WHERE video_id=? ORDER BY category_id',
+            (video_id,),
+        )]
+
+
+def set_video_categories(video_id, category_ids):
+    try:
+        selected = sorted({int(category_id) for category_id in category_ids})
+    except (TypeError, ValueError):
+        raise ValueError('Debes seleccionar al menos una categoría válida.')
+    if not selected:
+        raise ValueError('Debes seleccionar al menos una categoría.')
+    with con() as c:
+        if not c.execute('SELECT 1 FROM videos WHERE video_id=?', (video_id,)).fetchone():
+            raise ValueError('El vídeo no existe.')
+        placeholders = ','.join('?' for _ in selected)
+        valid = {row['id'] for row in c.execute(
+            f'SELECT id FROM categories WHERE id IN ({placeholders})', selected
+        )}
+        if valid != set(selected):
+            raise ValueError('Alguna categoría seleccionada no existe.')
+        c.execute('DELETE FROM video_categories WHERE video_id=?', (video_id,))
+        c.executemany(
+            'INSERT INTO video_categories(video_id, category_id) VALUES(?,?)',
+            [(video_id, category_id) for category_id in selected],
+        )
+        c.execute(
+            'UPDATE videos SET category_id=?, updated_at=CURRENT_TIMESTAMP WHERE video_id=?',
+            (selected[0], video_id),
+        )
+    return selected
+
+
+def _safe_library_path(root, filename):
+    candidate = Path(filename)
+    candidate = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    if not candidate.is_relative_to(root.resolve()):
+        raise ValueError('El archivo local no tiene una ruta segura dentro de la videoteca.')
+    return candidate
+
+
+def delete_video(video_id, delete_local=False):
+    if not _video_id_re.fullmatch(str(video_id or '')):
+        raise ValueError('El identificador del vídeo no es válido.')
+    with con() as c:
+        video = c.execute('SELECT * FROM videos WHERE video_id=?', (video_id,)).fetchone()
+        if not video:
+            raise ValueError('El vídeo no existe.')
+        shared_file = bool(video['filename'] and c.execute(
+            'SELECT 1 FROM videos WHERE video_id<>? AND filename=?',
+            (video_id, video['filename']),
+        ).fetchone())
+
+    paths = []
+    if delete_local:
+        if video['filename'] and not shared_file:
+            paths.append(_safe_library_path(VIDEOS, video['filename']))
+        paths.append(_safe_library_path(THUMBS, f'{video_id}.jpg'))
+
+    local_deleted = False
+    for path in paths:
+        if path.is_file():
+            path.unlink()
+            local_deleted = True
+
+    with con() as c:
+        c.execute('DELETE FROM video_categories WHERE video_id=?', (video_id,))
+        c.execute('DELETE FROM videos WHERE video_id=?', (video_id,))
+    return {'deleted': True, 'local_deleted': local_deleted, 'shared_file_kept': shared_file}
 
 
 def queue_video(video_id):
@@ -250,7 +340,8 @@ def queue_category(category_id):
             raise ValueError('Debes seleccionar una categoría válida.')
         cur = c.execute(
             "UPDATE videos SET status='pending', error=NULL, updated_at=CURRENT_TIMESTAMP "
-            "WHERE category_id=? AND status IN ('remote','error')",
+            "WHERE video_id IN (SELECT video_id FROM video_categories WHERE category_id=?) "
+            "AND status IN ('remote','error')",
             (category_id,),
         )
         return cur.rowcount
@@ -260,6 +351,7 @@ def find_tool(name):
     suffix = '.exe' if os.name == 'nt' else ''
     candidates = [
         shutil.which(name),
+        Path.home() / '.local' / 'bin' / f'{name}{suffix}',
         BINARY_DIR / f'{name}{suffix}',
         SOURCE_DIR / '.venv' / ('Scripts' if os.name == 'nt' else 'bin') / f'{name}{suffix}',
     ]
@@ -364,8 +456,11 @@ def group_order(label):
 
 def rows():
     with con() as c:
-        result = c.execute('''SELECT v.*, c.name AS category_name
-                              FROM videos v LEFT JOIN categories c ON c.id=v.category_id''').fetchall()
+        result = c.execute('''SELECT v.*, vc.category_id AS view_category_id,
+                                     c.name AS category_name
+                              FROM videos v
+                              LEFT JOIN video_categories vc ON vc.video_id=v.video_id
+                              LEFT JOIN categories c ON c.id=vc.category_id''').fetchall()
     return sorted(result, key=lambda r: (
         group_order(display_group(r)), natural_key(r['title'] or r['video_id'])
     ))
@@ -392,8 +487,9 @@ def base_css():
 :root{color-scheme:dark;--bg:#080d1a;--panel:#111a31;--panel2:#17213d;--line:#2b3a68;--text:#eef3ff;--muted:#aab6d5;--accent:#74b9ff;--ok:#38d996;--warn:#ffd166;--bad:#ff7583}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#17213d 0,#080d1a 32rem);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{position:sticky;top:0;z-index:10;background:#0d1428ee;backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}.head{max-width:1500px;margin:auto;padding:14px 18px}.top{display:flex;align-items:center;justify-content:space-between;gap:12px}.brand{font-size:1.35rem;font-weight:800;text-decoration:none}.summary{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.pill,.badge{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;background:#202d52;padding:4px 9px;color:#dce7ff;font-size:.78rem}.controls{display:grid;grid-template-columns:minmax(0,1fr) 190px;gap:10px;margin-top:12px}.controls input,.controls select{width:100%;border:1px solid #415488;border-radius:12px;background:#111a31;color:var(--text);padding:12px 14px;font-size:1rem;outline:none}.controls input:focus,.controls select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #74b9ff22}main{max-width:1500px;margin:auto;padding:18px}.group{margin:0 0 12px;border:1px solid var(--line);border-radius:15px;background:#0d1428aa;overflow:hidden}.group summary{cursor:pointer;list-style:none;padding:16px 18px;font-size:1.08rem;font-weight:800;display:flex;gap:8px;align-items:center;user-select:none}.group summary::-webkit-details-marker{display:none}.group summary::before{content:'›';font-size:1.55rem;line-height:.7;color:var(--accent);transition:transform .16s}.group[open] summary::before{transform:rotate(90deg)}.group summary:hover{background:#17213d}.group .grid{padding:0 14px 16px}.count{color:var(--muted);font-weight:500}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}.card{min-width:0;display:block;background:linear-gradient(160deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:15px;overflow:hidden;text-decoration:none;box-shadow:0 8px 25px #0003;transition:transform .16s,border-color .16s}.card:hover{transform:translateY(-2px);border-color:#6487ca}.card.done{border-color:#2f8e6b88}.card.running{border-color:#c99b36}.card.error{border-color:#b54e5a}.thumb{position:relative;aspect-ratio:16/9;background:linear-gradient(135deg,#1c294a,#0c1326);overflow:hidden}.thumb img{width:100%;height:100%;object-fit:cover;display:block}.thumb.placeholder{display:grid;place-items:center;color:#8291b7;font-size:2.2rem}.play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:48px;height:48px;border-radius:50%;display:grid;place-items:center;background:#050814cc;border:1px solid #ffffffaa;font-size:1.15rem;padding-left:3px}.duration{position:absolute;right:7px;bottom:7px;background:#050814df;border-radius:6px;padding:3px 6px;font-size:.75rem}.body{padding:12px}.meta{display:flex;gap:6px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:.75rem}.status-done{background:#123e31;border-color:#237b59}.status-running{background:#4a3914;border-color:#a37a21}.status-error{background:#4c2027;border-color:#9e4550}.title{font-size:.95rem;line-height:1.35;margin:9px 0 0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.empty{display:none;text-align:center;color:var(--muted);padding:55px 10px}.back{display:inline-flex;text-decoration:none;color:var(--accent);margin-bottom:16px}.watch{max-width:1100px}.player{width:100%;max-height:75vh;background:#000;border-radius:16px;box-shadow:0 15px 50px #0007}.watch h1{font-size:clamp(1.25rem,3vw,2rem);line-height:1.25}.watch-meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);margin:12px 0 20px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}.button{display:inline-flex;text-decoration:none;border:1px solid var(--line);background:#1b2a4c;padding:10px 14px;border-radius:11px;color:#dfe9ff}.notice{padding:18px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}
 .card{display:flex;flex-direction:column}.card[hidden],.group[hidden]{display:none!important}.card-main{display:block;flex:1;text-decoration:none;color:inherit}.card-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;padding:0 10px 10px}.card-actions a{min-width:0;text-align:center;text-decoration:none;border:1px solid #415488;border-radius:9px;background:#1b2a4c;color:#dfe9ff;padding:7px 5px;font-size:.76rem;font-weight:750;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.card-actions .youtube{border-color:#c94b55;background:#581e27;color:#fff}.card-actions a:hover{filter:brightness(1.16)}
-.card-actions button,.group-actions button,.manager button{border:1px solid #3e74bd;border-radius:9px;background:#17477c;color:#fff;padding:7px 6px;font:inherit;font-size:.76rem;font-weight:800;cursor:pointer}.card-actions button:nth-child(3){grid-column:1/-1}.group-actions{padding:0 14px 12px}.group-actions button{padding:9px 12px}.manager{max-width:1500px;margin:18px auto 0;border:1px solid #3b5388;border-radius:15px;background:#101a32;overflow:hidden}.manager>summary{cursor:pointer;padding:15px 18px;font-weight:850;color:#dfe9ff}.manager-grid{display:grid;grid-template-columns:minmax(0,.7fr) minmax(0,1.3fr);gap:14px;padding:0 16px 16px}.manager-card{min-width:0;background:#0b1226;border:1px solid var(--line);border-radius:13px;padding:14px}.manager-card h2{font-size:1rem;margin:0 0 12px}.manager-card label{display:grid;gap:6px;margin-bottom:11px;color:var(--muted);font-size:.82rem}.manager-card input,.manager-card select,.manager-card textarea{width:100%;min-width:0;border:1px solid #415488;border-radius:10px;background:#111a31;color:var(--text);padding:10px 11px;font:inherit}.manager-card textarea{resize:vertical}.manager-message{display:none;margin:0 16px 16px;padding:10px 12px;border-radius:10px;background:#123e31;color:#c9f7e2}.manager-message.error{background:#4c2027;color:#ffd6da}.manager-message.show{display:block}
-@media(max-width:650px){.head{padding:11px 12px}.top{align-items:flex-start}.brand{font-size:1.12rem}.summary .pill:nth-last-child(-n+2){display:none}.controls{grid-template-columns:1fr}.controls input,.controls select{padding:10px 12px}.manager{margin:12px 10px 0}.manager-grid{grid-template-columns:1fr;padding:0 10px 10px}main{padding:14px 10px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.body{padding:9px}.title{font-size:.84rem}.meta{font-size:.68rem}.play{width:40px;height:40px}.card-actions{gap:5px;padding:0 7px 7px}.card-actions a,.card-actions button{font-size:.68rem;padding:6px 3px}.watch{padding:14px}.player{border-radius:10px}}
+.card-actions button,.group-actions button,.manager button{border:1px solid #3e74bd;border-radius:9px;background:#17477c;color:#fff;padding:7px 6px;font:inherit;font-size:.76rem;font-weight:800;cursor:pointer}.card-actions .download,.card-actions .manage-video{grid-column:1/-1}.group-actions{padding:0 14px 12px}.group-actions button{padding:9px 12px}.manager{max-width:1500px;margin:18px auto 0;border:1px solid #3b5388;border-radius:15px;background:#101a32;overflow:hidden}.manager>summary{cursor:pointer;padding:15px 18px;font-weight:850;color:#dfe9ff}.manager-grid{display:grid;grid-template-columns:minmax(0,.7fr) minmax(0,1.3fr);gap:14px;padding:0 16px 16px}.manager-card{min-width:0;background:#0b1226;border:1px solid var(--line);border-radius:13px;padding:14px}.manager-card h2{font-size:1rem;margin:0 0 12px}.manager-card label{display:grid;gap:6px;margin-bottom:11px;color:var(--muted);font-size:.82rem}.manager-card input,.manager-card select,.manager-card textarea{width:100%;min-width:0;border:1px solid #415488;border-radius:10px;background:#111a31;color:var(--text);padding:10px 11px;font:inherit}.manager-card textarea{resize:vertical}.manager-message{display:none;margin:0 16px 16px;padding:10px 12px;border-radius:10px;background:#123e31;color:#c9f7e2}.manager-message.error{background:#4c2027;color:#ffd6da}.manager-message.show{display:block}
+.video-dialog{width:min(560px,calc(100vw - 24px));max-height:90vh;overflow:auto;border:1px solid #526da8;border-radius:16px;background:#101a32;color:var(--text);padding:0;box-shadow:0 24px 80px #000a}.video-dialog::backdrop{background:#030712cc;backdrop-filter:blur(3px)}.dialog-body{padding:18px}.dialog-body h2{margin:0 0 5px;font-size:1.2rem}.dialog-title{color:var(--muted);margin:0 0 16px;word-break:break-word}.category-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:10px 0 18px}.category-check{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:10px;background:#0b1226;padding:9px;min-width:0}.category-check input{width:18px;height:18px;flex:0 0 auto}.category-check span{overflow:hidden;text-overflow:ellipsis}.dialog-actions{display:flex;gap:8px;flex-wrap:wrap}.dialog-actions button{border:1px solid #3e74bd;border-radius:10px;background:#17477c;color:#fff;padding:10px 12px;font:inherit;font-weight:800;cursor:pointer}.dialog-actions .secondary{background:#1b2a4c;border-color:#415488}.delete-zone{margin-top:20px;padding-top:16px;border-top:1px solid var(--line)}.delete-option{display:flex;align-items:flex-start;gap:9px;color:#ffd9dd;font-size:.9rem;margin:12px 0}.delete-option input{width:18px;height:18px;flex:0 0 auto}.dialog-actions .danger{background:#7a2631;border-color:#dc6170}.dialog-error{display:none;color:#ffd6da;background:#4c2027;border-radius:9px;padding:9px;margin:10px 0}.dialog-error.show{display:block}
+@media(max-width:650px){.head{padding:11px 12px}.top{align-items:flex-start}.brand{font-size:1.12rem}.summary .pill:nth-last-child(-n+2){display:none}.controls{grid-template-columns:1fr}.controls input,.controls select{padding:10px 12px}.manager{margin:12px 10px 0}.manager-grid{grid-template-columns:1fr;padding:0 10px 10px}main{padding:14px 10px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.body{padding:9px}.title{font-size:.84rem}.meta{font-size:.68rem}.play{width:40px;height:40px}.card-actions{gap:5px;padding:0 7px 7px}.card-actions a,.card-actions button{font-size:.68rem;padding:6px 3px}.category-checks{grid-template-columns:1fr}.watch{padding:14px}.player{border-radius:10px}}
 """
 
 
@@ -401,10 +497,15 @@ def landing_page():
     all_rows = rows()
     categories = list_categories()
     counts = {}
+    seen_videos = set()
+    membership_map = {}
     groups = {category['name']: [] for category in categories}
     category_ids = {category['name']: category['id'] for category in categories}
     for r in all_rows:
-        counts[r['status']] = counts.get(r['status'], 0) + 1
+        membership_map.setdefault(r['video_id'], []).append(r['view_category_id'])
+        if r['video_id'] not in seen_videos:
+            seen_videos.add(r['video_id'])
+            counts[r['status']] = counts.get(r['status'], 0) + 1
         groups.setdefault(display_group(r), []).append(r)
 
     cards_by_group = []
@@ -434,10 +535,12 @@ def landing_page():
                 f'<h3 class="title">{esc(title)}</h3></div></a>'
                 f'<div class="card-actions"><a href="/watch/{esc(r["video_id"])}">Ver local</a>'
                 f'<a class="youtube" href="{esc(r["url"])}" target="_blank" rel="noreferrer">YouTube ↗</a>'
-                + (f'<button type="button" data-download-video="{esc(r["video_id"])}">Descargar</button>' if status in ('remote', 'error') else '')
+                + (f'<button class="download" type="button" data-download-video="{esc(r["video_id"])}">Descargar</button>' if status in ('remote', 'error') else '')
+                + f'<button class="manage-video" type="button" data-manage-video="{esc(r["video_id"])}" '
+                  f'data-video-title="{esc(title)}" data-category-ids="{",".join(str(value) for value in membership_map[r["video_id"]] if value is not None)}">Organizar / borrar</button>'
                 + '</div></article>'
             )
-        category_id = items[0]['category_id'] if items else category_ids.get(group)
+        category_id = items[0]['view_category_id'] if items else category_ids.get(group)
         cards_by_group.append(
             f'<details class="group" data-group="{esc(group.casefold())}"><summary>{esc(group)} '
             f'<span class="count">{len(items)}</span></summary>'
@@ -446,7 +549,7 @@ def landing_page():
         )
 
     summary = (
-        f'<span class="pill">Total: {len(all_rows)}</span>'
+        f'<span class="pill">Total: {len(seen_videos)}</span>'
         f'<span class="pill">Disponibles: {counts.get("done", 0)}</span>'
         f'<span class="pill">Sin descargar: {counts.get("remote", 0)}</span>'
         f'<span class="pill">Descargando: {counts.get("running", 0)}</span>'
@@ -456,10 +559,23 @@ def landing_page():
     category_options = ''.join(
         f'<option value="{category["id"]}">{esc(category["name"])}</option>' for category in categories
     )
+    category_checkboxes = ''.join(
+        f'<label class="category-check"><input type="checkbox" name="managed_categories" '
+        f'value="{category["id"]}"><span>{esc(category["name"])}</span></label>'
+        for category in categories
+    )
     manager = f'''<details class="manager"><summary>Gestionar videoteca</summary><div class="manager-grid">
 <form id="categoryForm" class="manager-card"><h2>Crear categoría</h2><label>Nombre<input name="name" required maxlength="80" placeholder="Ej. Tafsir 26/27"></label><button type="submit">Crear categoría</button></form>
 <form id="videoForm" class="manager-card"><h2>Añadir vídeos</h2><label>Categoría<select name="category_id" required><option value="" selected disabled>Selecciona una categoría</option>{category_options}</select></label><label>Vídeos o playlists<textarea name="urls" required rows="5" placeholder="Pega un vídeo, una playlist o varias URLs (una por línea)"></textarea></label><button type="submit">Añadir a la videoteca</button></form>
 </div><p id="managerMessage" class="manager-message" role="status"></p></details>'''
+    video_dialog = f'''<dialog id="videoManageDialog" class="video-dialog"><form id="videoManageForm" class="dialog-body">
+<input type="hidden" name="video_id"><h2>Organizar o borrar vídeo</h2><p id="managedVideoTitle" class="dialog-title"></p>
+<strong>Categorías</strong><div class="category-checks">{category_checkboxes}</div>
+<p id="videoDialogError" class="dialog-error" role="alert"></p>
+<div class="dialog-actions"><button type="submit">Guardar categorías</button><button type="button" class="secondary" data-close-video-dialog>Cancelar</button></div>
+<div class="delete-zone"><strong>Eliminar de la videoteca</strong><label class="delete-option"><input id="deleteLocal" type="checkbox">Eliminar también el archivo de vídeo y su miniatura del disco</label>
+<div class="dialog-actions"><button id="deleteVideoButton" type="button" class="danger">Borrar vídeo</button></div></div>
+</form></dialog>'''
     script = """
 const q=document.querySelector('#q'),status=document.querySelector('#status'),empty=document.querySelector('#empty');
 const normSearch=value=>value.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLocaleLowerCase('es').replace(/\\s+/g,' ').trim();
@@ -484,6 +600,12 @@ async function postJson(path,payload){
 }
 document.querySelector('#categoryForm').addEventListener('submit',async event=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{await postJson('/api/categories',{name:new FormData(event.currentTarget).get('name')});location.reload();}catch(error){showMessage(error.message,true);button.disabled=false;}});
 document.querySelector('#videoForm').addEventListener('submit',async event=>{event.preventDefault();const button=event.submitter;button.disabled=true;showMessage('Leyendo enlaces y playlists…');const form=new FormData(event.currentTarget);try{const result=await postJson('/api/videos/add',{category_id:form.get('category_id'),urls:form.get('urls')});showMessage(`Añadidos: ${result.added}. Ya existentes: ${result.existing}.`);setTimeout(()=>location.reload(),700);}catch(error){showMessage(error.message,true);button.disabled=false;}});
+const videoDialog=document.querySelector('#videoManageDialog'),videoManageForm=document.querySelector('#videoManageForm'),videoDialogError=document.querySelector('#videoDialogError');
+function showDialogError(text=''){videoDialogError.textContent=text;videoDialogError.classList.toggle('show',Boolean(text));}
+document.addEventListener('click',event=>{const button=event.target.closest('[data-manage-video]');if(!button)return;const selected=new Set(button.dataset.categoryIds.split(',').filter(Boolean));videoManageForm.elements.video_id.value=button.dataset.manageVideo;document.querySelector('#managedVideoTitle').textContent=button.dataset.videoTitle;videoManageForm.querySelectorAll('[name="managed_categories"]').forEach(input=>{input.checked=selected.has(input.value);});document.querySelector('#deleteLocal').checked=false;showDialogError();videoDialog.showModal();});
+document.querySelector('[data-close-video-dialog]').addEventListener('click',()=>videoDialog.close());
+videoManageForm.addEventListener('submit',async event=>{event.preventDefault();const button=event.submitter;const categoryIds=[...videoManageForm.querySelectorAll('[name="managed_categories"]:checked')].map(input=>Number(input.value));if(!categoryIds.length){showDialogError('Selecciona al menos una categoría.');return;}button.disabled=true;try{await postJson('/api/videos/categories',{video_id:videoManageForm.elements.video_id.value,category_ids:categoryIds});location.reload();}catch(error){showDialogError(error.message);button.disabled=false;}});
+document.querySelector('#deleteVideoButton').addEventListener('click',async event=>{const deleteLocal=document.querySelector('#deleteLocal').checked;const message=deleteLocal?'Se borrará el vídeo de la videoteca Y TAMBIÉN su archivo local. ¿Continuar?':'Se borrará el vídeo de la videoteca, pero se conservará el archivo local. ¿Continuar?';if(!confirm(message))return;const button=event.currentTarget;button.disabled=true;try{await postJson('/api/videos/delete',{video_id:videoManageForm.elements.video_id.value,delete_local:deleteLocal});location.reload();}catch(error){showDialogError(error.message);button.disabled=false;}});
 document.addEventListener('click',async event=>{
   const videoButton=event.target.closest('[data-download-video]'), categoryButton=event.target.closest('[data-download-category]');
   if(!videoButton&&!categoryButton)return;
@@ -493,7 +615,7 @@ document.addEventListener('click',async event=>{
 """
     return f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Videoteca</title><style>{base_css()}</style></head><body>
 <header><div class="head"><div class="top"><a class="brand" href="/">Videoteca</a><span class="pill">Descarga secuencial</span></div><div class="summary">{summary}</div><div class="controls"><input id="q" type="search" placeholder="Buscar clase, tema o identificador…" autocomplete="off" aria-label="Buscar vídeos"><select id="status" aria-label="Filtrar por estado"><option value="">Todos los estados</option><option value="done">Solo disponibles</option><option value="remote">Sin descargar</option><option value="running">Descargando</option><option value="pending">Pendientes</option><option value="error">Fallidos</option></select></div></div></header>
-{manager}<main>{''.join(cards_by_group)}<div id="empty" class="empty">No hay vídeos que coincidan con la búsqueda.</div></main><script>{script}</script></body></html>'''
+{manager}{video_dialog}<main>{''.join(cards_by_group)}<div id="empty" class="empty">No hay vídeos que coincidan con la búsqueda.</div></main><script>{script}</script></body></html>'''
 
 
 def watch_page(video_id):
@@ -551,6 +673,15 @@ class H(BaseHTTPRequestHandler):
                 return
             if path == '/api/videos/add':
                 self.send_json(add_video_urls(payload.get('category_id'), payload.get('urls')), 201)
+                return
+            if path == '/api/videos/categories':
+                category_ids = set_video_categories(payload.get('video_id'), payload.get('category_ids'))
+                self.send_json({'category_ids': category_ids})
+                return
+            if path == '/api/videos/delete':
+                self.send_json(delete_video(
+                    payload.get('video_id'), delete_local=payload.get('delete_local') is True
+                ))
                 return
             if path == '/api/download/video':
                 queued = queue_video(payload.get('video_id'))

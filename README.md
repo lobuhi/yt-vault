@@ -9,6 +9,9 @@ Videoteca web local, ligera y sin dependencias de frontend, para organizar enlac
 ## Características
 
 - Categorías desplegables creadas desde la propia interfaz.
+- Un mismo vídeo puede pertenecer a varias categorías y aparecer en cada una de ellas.
+- Reorganización de categorías desde cada tarjeta mediante selección múltiple.
+- Borrado desde el frontal, conservando el archivo local o eliminándolo también tras confirmación explícita.
 - Alta de vídeos individuales, identificadores de YouTube o playlists completas.
 - Expansión automática de playlists mediante `yt-dlp`.
 - Estados separados: sin descargar, pendiente, descargando, disponible y fallido.
@@ -103,6 +106,8 @@ Sin `systemd`, el descargador se ejecuta en un hilo de fondo dentro del proceso 
    - un identificador de vídeo.
 5. Pulsa **Añadir a la videoteca**.
 6. Descarga un vídeo concreto o pulsa **Descargar toda la categoría**.
+
+Cada tarjeta incorpora **Organizar / borrar**. Desde ese diálogo puedes marcar varias categorías, mover el vídeo a otras categorías o eliminar su registro. La casilla **Eliminar también el archivo de vídeo y su miniatura del disco** está desmarcada de forma predeterminada y requiere una confirmación adicional antes del borrado.
 
 Añadir un vídeo al catálogo **no lo descarga automáticamente**. Solo se descargan filas encoladas explícitamente.
 
@@ -204,6 +209,8 @@ GitHub Actions compilará Windows y publicará automáticamente una release con:
 | `GET` | `/api/videos` | Lista del catálogo |
 | `POST` | `/api/categories` | Crear categoría |
 | `POST` | `/api/videos/add` | Añadir vídeos o playlist |
+| `POST` | `/api/videos/categories` | Sustituir la selección de categorías de un vídeo |
+| `POST` | `/api/videos/delete` | Borrar el registro y, opcionalmente, sus archivos locales |
 | `POST` | `/api/download/video` | Encolar un vídeo |
 | `POST` | `/api/download/category` | Encolar una categoría |
 

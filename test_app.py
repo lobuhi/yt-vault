@@ -16,10 +16,19 @@ class PortalFeatureTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Path(self.tmp.name) / "portal.sqlite3"
         self.db_patch = patch.object(app, "DB", self.db)
+        self.root_patch = patch.object(app, "ROOT", Path(self.tmp.name))
+        self.videos_patch = patch.object(app, "VIDEOS", Path(self.tmp.name) / "videos")
+        self.thumbs_patch = patch.object(app, "THUMBS", Path(self.tmp.name) / "thumbs")
         self.db_patch.start()
+        self.root_patch.start()
+        self.videos_patch.start()
+        self.thumbs_patch.start()
         app.init()
 
     def tearDown(self):
+        self.thumbs_patch.stop()
+        self.videos_patch.stop()
+        self.root_patch.stop()
         self.db_patch.stop()
         self.tmp.cleanup()
 
@@ -79,6 +88,71 @@ class PortalFeatureTests(unittest.TestCase):
         with app.con() as c:
             titles = [r[0] for r in c.execute("SELECT title FROM videos ORDER BY rowid")]
         self.assertEqual(titles, ["Vídeo uno", "Vídeo dos"])
+    def test_video_can_belong_to_multiple_categories(self):
+        first = app.create_category("Tafsir")
+        second = app.create_category("Ramadán")
+        app.add_video_urls(first["id"], "dQw4w9WgXcQ")
+        result = app.add_video_urls(second["id"], "dQw4w9WgXcQ")
+        self.assertEqual(result["existing"], 1)
+        self.assertEqual(app.video_category_ids("dQw4w9WgXcQ"), [first["id"], second["id"]])
+        page = app.landing_page()
+        self.assertEqual(page.count('data-manage-video="dQw4w9WgXcQ"'), 2)
+        self.assertIn('Total: 1', page)
+
+    def test_reorganize_video_replaces_its_categories(self):
+        first = app.create_category("Primera")
+        second = app.create_category("Segunda")
+        third = app.create_category("Tercera")
+        app.add_video_urls(first["id"], "dQw4w9WgXcQ")
+        app.set_video_categories("dQw4w9WgXcQ", [second["id"], third["id"]])
+        self.assertEqual(app.video_category_ids("dQw4w9WgXcQ"), [second["id"], third["id"]])
+        with self.assertRaisesRegex(ValueError, "categoría"):
+            app.set_video_categories("dQw4w9WgXcQ", [])
+
+    def test_delete_video_keeps_local_files_unless_requested(self):
+        category = app.create_category("Archivo")
+        app.add_video_urls(category["id"], "dQw4w9WgXcQ")
+        media = app.VIDEOS / "video local.mp4"
+        thumb = app.THUMBS / "dQw4w9WgXcQ.jpg"
+        media.write_bytes(b"video")
+        thumb.write_bytes(b"thumb")
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (media.name, "dQw4w9WgXcQ"))
+        result = app.delete_video("dQw4w9WgXcQ", delete_local=False)
+        self.assertFalse(result["local_deleted"])
+        self.assertTrue(media.is_file())
+        self.assertTrue(thumb.is_file())
+        with app.con() as c:
+            self.assertIsNone(c.execute("SELECT 1 FROM videos WHERE video_id=?", ("dQw4w9WgXcQ",)).fetchone())
+
+    def test_delete_video_can_remove_its_safe_local_files(self):
+        category = app.create_category("Archivo")
+        app.add_video_urls(category["id"], "dQw4w9WgXcQ")
+        media = app.VIDEOS / "video local.mp4"
+        thumb = app.THUMBS / "dQw4w9WgXcQ.jpg"
+        media.write_bytes(b"video")
+        thumb.write_bytes(b"thumb")
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (media.name, "dQw4w9WgXcQ"))
+        result = app.delete_video("dQw4w9WgXcQ", delete_local=True)
+        self.assertTrue(result["local_deleted"])
+        self.assertFalse(media.exists())
+        self.assertFalse(thumb.exists())
+
+    def test_delete_video_rejects_a_filename_outside_the_library(self):
+        category = app.create_category("Archivo")
+        app.add_video_urls(category["id"], "dQw4w9WgXcQ")
+        outside = Path(self.tmp.name).parent / "no-borrar.mp4"
+        outside.write_bytes(b"protegido")
+        self.addCleanup(lambda: outside.unlink(missing_ok=True))
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=? WHERE video_id=?", (str(outside), "dQw4w9WgXcQ"))
+        with self.assertRaisesRegex(ValueError, "segura"):
+            app.delete_video("dQw4w9WgXcQ", delete_local=True)
+        self.assertTrue(outside.is_file())
+        with app.con() as c:
+            self.assertIsNotNone(c.execute("SELECT 1 FROM videos WHERE video_id=?", ("dQw4w9WgXcQ",)).fetchone())
+
     def test_queue_video_and_whole_category_skip_downloaded_items(self):
         category = app.create_category("Descargas")
         app.add_video_urls(category["id"], "dQw4w9WgXcQ\naqz-KE-bpKQ\nM7lc1UVf-VE")
@@ -115,6 +189,10 @@ class PortalFeatureTests(unittest.TestCase):
         self.assertIn('id="videoForm"', page)
         self.assertIn('<option value="" selected disabled>Selecciona una categoría</option>', page)
         self.assertIn('data-download-video="dQw4w9WgXcQ"', page)
+        self.assertIn('data-manage-video="dQw4w9WgXcQ"', page)
+        self.assertIn('id="videoManageDialog"', page)
+        self.assertIn('id="deleteLocal"', page)
+        self.assertIn('name="managed_categories"', page)
         self.assertIn(f'data-download-category="{category["id"]}"', page)
 
     def test_json_api_creates_adds_and_queues(self):
@@ -141,6 +219,36 @@ class PortalFeatureTests(unittest.TestCase):
                 status, queued = post('/api/download/video', {'video_id': 'dQw4w9WgXcQ'})
             self.assertEqual((status, queued['queued']), (200, 1))
             starter.assert_called_once_with()
+        finally:
+            server.shutdown()
+            server.server_close()
+    def test_json_api_reorganizes_and_deletes_a_video(self):
+        first = app.create_category("Primera")
+        second = app.create_category("Segunda")
+        app.add_video_urls(first["id"], "dQw4w9WgXcQ")
+        server = ThreadingHTTPServer(('127.0.0.1', 0), app.H)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def post(path, payload):
+            req = request.Request(
+                f'http://127.0.0.1:{server.server_port}{path}',
+                data=json.dumps(payload).encode(),
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            with request.urlopen(req, timeout=5) as response:
+                return response.status, json.load(response)
+
+        try:
+            status, changed = post('/api/videos/categories', {
+                'video_id': 'dQw4w9WgXcQ', 'category_ids': [first['id'], second['id']],
+            })
+            self.assertEqual((status, changed['category_ids']), (200, [first['id'], second['id']]))
+            status, deleted = post('/api/videos/delete', {
+                'video_id': 'dQw4w9WgXcQ', 'delete_local': False,
+            })
+            self.assertEqual((status, deleted['deleted']), (200, True))
         finally:
             server.shutdown()
             server.server_close()

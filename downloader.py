@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib, json, os, re, shutil, sqlite3, subprocess, sys, time, datetime
 from pathlib import Path
 SOURCE_DIR=Path(__file__).resolve().parent; FROZEN=bool(getattr(sys,'frozen',False)); BINARY_DIR=Path(sys.executable).resolve().parent if FROZEN else SOURCE_DIR
-DEFAULT_ROOT=(Path(os.environ.get('LOCALAPPDATA') or Path.home())/'VideotecaYouTube') if FROZEN else SOURCE_DIR
+DEFAULT_ROOT=(Path(os.environ.get('LOCALAPPDATA') or Path.home())/'YTVault') if FROZEN else SOURCE_DIR
 ROOT=Path(os.environ.get('VIDEOTECA_HOME',DEFAULT_ROOT)).expanduser().resolve(); DB=ROOT/'data'/'portal.sqlite3'; VIDEOS=ROOT/'videos'; THUMBS=ROOT/'thumbs'; TMP=ROOT/'tmp'; LOG=ROOT/'logs'/'downloader.log'; SCHEMA="\nCREATE TABLE IF NOT EXISTS videos(\n  video_id TEXT PRIMARY KEY,\n  url TEXT NOT NULL,\n  source TEXT,\n  title TEXT,\n  filename TEXT,\n  status TEXT NOT NULL DEFAULT 'pending',\n  error TEXT,\n  attempts INTEGER NOT NULL DEFAULT 0,\n  duration REAL,\n  filesize INTEGER,\n  priority INTEGER NOT NULL DEFAULT 0,\n  category TEXT,\n  upload_date TEXT,\n  metadata_attempts INTEGER NOT NULL DEFAULT 0,\n  last_metadata_error TEXT,\n  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,\n  created_at TEXT DEFAULT CURRENT_TIMESTAMP\n);\nCREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);\nCREATE INDEX IF NOT EXISTS idx_videos_source ON videos(source);\nCREATE INDEX IF NOT EXISTS idx_videos_priority ON videos(priority DESC, title COLLATE NOCASE);\n"
 # La cola es siempre secuencial. Entre descargas correctas basta una pausa
 # corta; los fallos conservan un backoff mayor para no insistir contra YouTube.

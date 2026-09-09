@@ -25,14 +25,14 @@ jobs:
       - name: Instalar PyInstaller
         run: python -m pip install --upgrade pyinstaller
 
-      - name: Compilar VideotecaYouTube.exe
+      - name: Compilar YTVault.exe
         shell: pwsh
         run: |
           python -m PyInstaller `
             --onefile `
             --noconsole `
             --clean `
-            --name VideotecaYouTube `
+            --name YTVault `
             --hidden-import downloader `
             --add-data "seed_urls.json;." `
             app.py
@@ -55,16 +55,16 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path "dist/VideotecaYouTube.exe", "dist/yt-dlp.exe", "dist/ffmpeg.exe" `
-            -DestinationPath "dist/VideotecaYouTube-Windows.zip"
+            -Path "dist/YTVault.exe", "dist/yt-dlp.exe", "dist/ffmpeg.exe" `
+            -DestinationPath "dist/YTVault-Windows.zip"
 
       - name: Guardar artefacto
         uses: actions/upload-artifact@v7
         with:
-          name: VideotecaYouTube-Windows
+          name: YTVault-Windows
           path: |
-            dist/VideotecaYouTube.exe
-            dist/VideotecaYouTube-Windows.zip
+            dist/YTVault.exe
+            dist/YTVault-Windows.zip
           if-no-files-found: error
 
       - name: Publicar release para etiquetas
@@ -73,5 +73,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            dist/VideotecaYouTube.exe
-            dist/VideotecaYouTube-Windows.zip
+            dist/YTVault.exe
+            dist/YTVault-Windows.zip

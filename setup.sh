@@ -6,8 +6,8 @@ cd "$ROOT"
 PORT="${PORT:-8802}"
 HOST="${HOST:-0.0.0.0}"
 PYTHON="${PYTHON:-python3}"
-PORTAL_SERVICE="videoteca-youtube.service"
-DOWNLOADER_SERVICE="videoteca-youtube-downloader.service"
+PORTAL_SERVICE="yt-vault.service"
+DOWNLOADER_SERVICE="yt-vault-downloader.service"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 command -v "$PYTHON" >/dev/null || fail "No se encontró Python 3.10 o posterior."
@@ -45,7 +45,7 @@ if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/nu
     mkdir -p "$UNIT_DIR"
     cat > "$UNIT_DIR/$DOWNLOADER_SERVICE" <<EOF
 [Unit]
-Description=Descargador secuencial de Videoteca YouTube
+Description=Descargador secuencial de YT Vault
 After=network-online.target
 Wants=network-online.target
 

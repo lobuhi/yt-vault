@@ -1,4 +1,4 @@
-# Videoteca YouTube
+# YT Vault
 
 Videoteca web local, ligera y sin dependencias de frontend, para organizar enlaces de YouTube por categorías y descargar únicamente los vídeos que el usuario elija.
 
@@ -42,8 +42,8 @@ sudo apt install python3 python3-venv ffmpeg
 ### Instalación automática
 
 ```bash
-git clone https://github.com/lobuhi/videoteca-youtube.git
-cd videoteca-youtube
+git clone https://github.com/lobuhi/yt-vault.git
+cd yt-vault
 chmod +x setup.sh
 ./setup.sh
 ```
@@ -53,7 +53,7 @@ El instalador:
 1. crea `.venv`;
 2. instala `yt-dlp`;
 3. crea una base SQLite vacía;
-4. instala e inicia `videoteca-youtube.service` cuando `systemd --user` está disponible;
+4. instala e inicia `yt-vault.service` cuando `systemd --user` está disponible;
 5. utiliza el puerto **8802** de forma predeterminada.
 
 Abre:
@@ -121,9 +121,9 @@ En una instalación desde código, los datos se guardan dentro del proyecto:
 Para hacer una copia completa, detén temporalmente el servicio y copia esas rutas:
 
 ```bash
-systemctl --user stop videoteca-youtube.service videoteca-youtube-downloader.service
+systemctl --user stop yt-vault.service yt-vault-downloader.service
 cp -a data videos thumbs /ruta/de/copia/
-systemctl --user start videoteca-youtube.service
+systemctl --user start yt-vault.service
 ```
 
 Estos contenidos están excluidos de Git mediante `.gitignore`.
@@ -132,17 +132,17 @@ Estos contenidos están excluidos de Git mediante `.gitignore`.
 
 ```bash
 # Estado
-systemctl --user status videoteca-youtube.service
-systemctl --user status videoteca-youtube-downloader.service
+systemctl --user status yt-vault.service
+systemctl --user status yt-vault-downloader.service
 
 # Reiniciar portal
-systemctl --user restart videoteca-youtube.service
+systemctl --user restart yt-vault.service
 
 # Registro del portal
-journalctl --user -u videoteca-youtube.service -f
+journalctl --user -u yt-vault.service -f
 
 # Registro de descargas
-journalctl --user -u videoteca-youtube-downloader.service -f
+journalctl --user -u yt-vault-downloader.service -f
 ```
 
 El servicio del descargador aparece normalmente como `inactive` cuando la cola está vacía. Se inicia al pulsar un botón de descarga y termina al completar la cola.
@@ -156,20 +156,20 @@ El proyecto incluye el flujo de GitHub Actions `.github/workflows/build-windows.
 1. Entra en la pestaña **Actions** del repositorio.
 2. Selecciona **Compilar para Windows**.
 3. Pulsa **Run workflow**.
-4. Descarga el artefacto `VideotecaYouTube-Windows`.
+4. Descarga el artefacto `YTVault-Windows`.
 
 El paquete contiene:
 
-- `VideotecaYouTube.exe`;
+- `YTVault.exe`;
 - `yt-dlp.exe`;
 - `ffmpeg.exe`.
 
-Los tres archivos deben permanecer juntos para poder descargar vídeos. Al abrir `VideotecaYouTube.exe`, la aplicación usa el puerto 8802 y abre el navegador automáticamente.
+Los tres archivos deben permanecer juntos para poder descargar vídeos. Al abrir `YTVault.exe`, la aplicación usa el puerto 8802 y abre el navegador automáticamente.
 
 Los datos de Windows se guardan fuera del ejecutable, en:
 
 ```text
-%LOCALAPPDATA%\VideotecaYouTube\
+%LOCALAPPDATA%\YTVault\
 ```
 
 ### Publicar una release automáticamente
@@ -183,14 +183,14 @@ git push origin v1.0.0
 
 GitHub Actions compilará Windows y publicará automáticamente una release con:
 
-- `VideotecaYouTube.exe`;
-- `VideotecaYouTube-Windows.zip`, que incluye las herramientas necesarias.
+- `YTVault.exe`;
+- `YTVault-Windows.zip`, que incluye las herramientas necesarias.
 
 ## Variables de entorno
 
 | Variable | Uso | Valor predeterminado |
 |---|---|---|
-| `VIDEOTECA_HOME` | Directorio de datos | Proyecto; `%LOCALAPPDATA%\VideotecaYouTube` en EXE |
+| `VIDEOTECA_HOME` | Directorio de datos | Proyecto; `%LOCALAPPDATA%\YTVault` en EXE |
 | `VIDEOTECA_HOST` | Dirección de escucha | `127.0.0.1` |
 | `VIDEOTECA_PORT` | Puerto | `8802` |
 | `VIDEOTECA_DOWNLOADER_SERVICE` | Servicio Linux del descargador | Vacío; hilo integrado |

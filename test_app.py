@@ -23,6 +23,19 @@ class PortalFeatureTests(unittest.TestCase):
         self.db_patch.stop()
         self.tmp.cleanup()
 
+    def test_init_creates_a_missing_application_root(self):
+        root = Path(self.tmp.name) / "AppData" / "Local" / "YTVault"
+        with (
+            patch.object(app, "ROOT", root),
+            patch.object(app, "DB", root / "data" / "portal.sqlite3"),
+            patch.object(app, "VIDEOS", root / "videos"),
+            patch.object(app, "THUMBS", root / "thumbs"),
+        ):
+            app.init()
+            self.assertTrue((root / "data" / "portal.sqlite3").is_file())
+            self.assertTrue((root / "videos").is_dir())
+            self.assertTrue((root / "thumbs").is_dir())
+
     def test_create_category_requires_unique_nonempty_name(self):
         created = app.create_category("  Estudios nuevos  ")
         self.assertEqual(created["name"], "Estudios nuevos")

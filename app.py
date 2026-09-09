@@ -22,7 +22,7 @@ SOURCE_DIR = Path(__file__).resolve().parent
 FROZEN = bool(getattr(sys, 'frozen', False))
 BINARY_DIR = Path(sys.executable).resolve().parent if FROZEN else SOURCE_DIR
 if FROZEN:
-    default_root = Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'VideotecaYouTube'
+    default_root = Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'YTVault'
 else:
     default_root = SOURCE_DIR
 ROOT = Path(os.environ.get('VIDEOTECA_HOME', default_root)).expanduser().resolve()
@@ -95,9 +95,9 @@ def ensure_cols(c):
 
 
 def init():
-    (ROOT / 'data').mkdir(exist_ok=True)
-    VIDEOS.mkdir(exist_ok=True)
-    THUMBS.mkdir(exist_ok=True)
+    (ROOT / 'data').mkdir(parents=True, exist_ok=True)
+    VIDEOS.mkdir(parents=True, exist_ok=True)
+    THUMBS.mkdir(parents=True, exist_ok=True)
     with con() as c:
         try:
             c.executescript(SCHEMA)

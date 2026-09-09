@@ -68,6 +68,17 @@ CREATE TABLE IF NOT EXISTS video_categories(
   PRIMARY KEY(video_id, category_id)
 );
 CREATE INDEX IF NOT EXISTS idx_video_categories_category ON video_categories(category_id, video_id);
+CREATE TABLE IF NOT EXISTS file_cleanup_queue(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  video_id TEXT NOT NULL,
+  root_kind TEXT NOT NULL CHECK(root_kind IN ('videos','thumbs')),
+  filename TEXT NOT NULL,
+  filename_key TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(root_kind, filename_key)
+);
 CREATE INDEX IF NOT EXISTS idx_videos_priority ON videos(priority DESC, title COLLATE NOCASE);
 """
 
@@ -127,6 +138,7 @@ def init():
             c.execute('UPDATE videos SET category_id=? WHERE video_id=?', (category_id, video['video_id']))
         c.execute('''INSERT OR IGNORE INTO video_categories(video_id, category_id)
                      SELECT video_id, category_id FROM videos WHERE category_id IS NOT NULL''')
+    retry_file_cleanup()
 
 
 def create_category(name):
@@ -290,6 +302,13 @@ def _safe_library_name(filename):
     return name
 
 
+def _filename_identity(filename):
+    # Clave deliberadamente conservadora: evita borrar alias de un mismo nombre
+    # en Windows y en otros sistemas de archivos que ignoran mayúsculas o normalizan Unicode.
+    name = _safe_library_name(filename)
+    return unicodedata.normalize('NFKC', name).rstrip(' .').casefold()
+
+
 def _windows_unlink_from_root(root, name):
     import ctypes
     from ctypes import wintypes
@@ -419,6 +438,58 @@ def _unlink_library_file(root, filename):
         os.close(directory_fd)
 
 
+def retry_file_cleanup(task_ids=None):
+    params = []
+    where = ''
+    if task_ids is not None:
+        ids = [int(task_id) for task_id in task_ids]
+        if not ids:
+            return {'local_deleted': False, 'file_errors': []}
+        where = f" WHERE id IN ({','.join('?' for _ in ids)})"
+        params = ids
+    with con() as c:
+        pending_ids = [row['id'] for row in c.execute(
+            f'SELECT id FROM file_cleanup_queue{where} ORDER BY id', params,
+        ).fetchall()]
+    local_deleted = False
+    file_errors = []
+    roots = {'videos': VIDEOS, 'thumbs': THUMBS}
+    for task_id in pending_ids:
+        with con() as c:
+            # Serializa cualquier alta/reutilización del nombre hasta terminar el unlink.
+            c.execute('BEGIN IMMEDIATE')
+            task = c.execute(
+                '''SELECT id,video_id,root_kind,filename,filename_key
+                   FROM file_cleanup_queue WHERE id=?''',
+                (task_id,),
+            ).fetchone()
+            if not task:
+                continue
+            reused = c.execute('SELECT 1 FROM videos WHERE video_id=?', (task['video_id'],)).fetchone()
+            if not reused and task['root_kind'] == 'videos':
+                reused = any(
+                    _filename_identity(row['filename']) == task['filename_key']
+                    for row in c.execute('SELECT filename FROM videos WHERE filename IS NOT NULL')
+                )
+            if reused:
+                # La intención antigua deja de ser válida: nunca se aplicará a una generación futura.
+                c.execute('DELETE FROM file_cleanup_queue WHERE id=?', (task_id,))
+                file_errors.append(
+                    f"{task['filename']}: limpieza cancelada porque el archivo vuelve a estar en uso"
+                )
+                continue
+            try:
+                removed = _unlink_library_file(roots[task['root_kind']], task['filename'])
+                local_deleted = removed or local_deleted
+                c.execute('DELETE FROM file_cleanup_queue WHERE id=?', (task_id,))
+            except OSError as exc:
+                file_errors.append(f"{task['filename']}: {exc}")
+                c.execute('''UPDATE file_cleanup_queue
+                             SET attempts=attempts+1,last_error=? WHERE id=?''',
+                          (str(exc), task_id))
+    return {'local_deleted': local_deleted, 'file_errors': file_errors}
+
+
 def delete_video(video_id, delete_local=False):
     if not _video_id_re.fullmatch(str(video_id or '')):
         raise ValueError('El identificador del vídeo no es válido.')
@@ -435,8 +506,20 @@ def delete_video(video_id, delete_local=False):
         files = []
         if delete_local:
             if video['filename'] and not shared_file:
-                files.append((VIDEOS, _safe_library_name(video['filename'])))
-            files.append((THUMBS, _safe_library_name(f'{video_id}.jpg')))
+                files.append(('videos', _safe_library_name(video['filename'])))
+            files.append(('thumbs', _safe_library_name(f'{video_id}.jpg')))
+        cleanup_ids = []
+        for root_kind, filename in files:
+            filename_key = _filename_identity(filename)
+            c.execute(
+                '''INSERT OR IGNORE INTO file_cleanup_queue
+                   (video_id,root_kind,filename,filename_key) VALUES(?,?,?,?)''',
+                (video_id, root_kind, filename, filename_key),
+            )
+            cleanup_ids.append(c.execute(
+                'SELECT id FROM file_cleanup_queue WHERE root_kind=? AND filename_key=?',
+                (root_kind, filename_key),
+            ).fetchone()['id'])
         deleted = c.execute(
             "DELETE FROM videos WHERE video_id=? AND status NOT IN ('pending','running')",
             (video_id,),
@@ -447,18 +530,12 @@ def delete_video(video_id, delete_local=False):
                 raise ValueError('No se puede borrar mientras la descarga está pendiente o en curso.')
             raise ValueError('El vídeo ya no existe.')
 
-    local_deleted = False
-    file_errors = []
-    for root, filename in files:
-        try:
-            local_deleted = _unlink_library_file(root, filename) or local_deleted
-        except OSError as exc:
-            file_errors.append(f'{filename}: {exc}')
+    cleanup = retry_file_cleanup(cleanup_ids)
     return {
         'deleted': True,
-        'local_deleted': local_deleted,
+        'local_deleted': cleanup['local_deleted'],
         'shared_file_kept': shared_file,
-        'file_errors': file_errors,
+        'file_errors': cleanup['file_errors'],
     }
 
 
@@ -634,9 +711,20 @@ def api_video_rows():
 
 def get_video(video_id):
     with con() as c:
-        return c.execute('''SELECT v.*, c.name AS category_name
-                            FROM videos v LEFT JOIN categories c ON c.id=v.category_id
-                            WHERE v.video_id=?''', (video_id,)).fetchone()
+        row = c.execute('SELECT * FROM videos WHERE video_id=?', (video_id,)).fetchone()
+        if not row:
+            return None
+        video = dict(row)
+        categories = [dict(category) for category in c.execute(
+            '''SELECT c.id,c.name FROM video_categories vc
+               JOIN categories c ON c.id=vc.category_id
+               WHERE vc.video_id=? ORDER BY c.name COLLATE NOCASE''',
+            (video_id,),
+        ).fetchall()]
+    video['category_ids'] = [category['id'] for category in categories]
+    video['categories'] = categories
+    video['category_name'] = categories[0]['name'] if categories else None
+    return video
 
 
 def format_duration(seconds):
@@ -799,7 +887,8 @@ def watch_page(video_id):
     error = ''
     if status == 'error' and (r['error'] or r['last_metadata_error']):
         error = f'<div class="notice" style="margin-top:12px;color:#ffc2c8">{esc(r["error"] or r["last_metadata_error"])}</div>'
-    return f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Videoteca</title><style>{base_css()}</style></head><body><header><div class="head"><a class="brand" href="/">Videoteca</a></div></header><main class="watch"><a class="back" href="/">← Volver a la videoteca</a>{content}<h1>{esc(title)}</h1><div class="watch-meta"><span class="badge status-{esc(status)}">{esc(status)}</span><span>{esc(display_group(r))}</span><span>{esc(format_duration(r['duration']))}</span><span>{esc(video_id)}</span></div><div class="actions"><a class="button" href="{esc(r['url'])}" target="_blank" rel="noreferrer">Abrir en YouTube</a></div>{error}</main></body></html>'''
+    category_names = ', '.join(category['name'] for category in r['categories']) or display_group(r)
+    return f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Videoteca</title><style>{base_css()}</style></head><body><header><div class="head"><a class="brand" href="/">Videoteca</a></div></header><main class="watch"><a class="back" href="/">← Volver a la videoteca</a>{content}<h1>{esc(title)}</h1><div class="watch-meta"><span class="badge status-{esc(status)}">{esc(status)}</span><span>{esc(category_names)}</span><span>{esc(format_duration(r['duration']))}</span><span>{esc(video_id)}</span></div><div class="actions"><a class="button" href="{esc(r['url'])}" target="_blank" rel="noreferrer">Abrir en YouTube</a></div>{error}</main></body></html>'''
 
 
 class H(BaseHTTPRequestHandler):
@@ -825,9 +914,12 @@ class H(BaseHTTPRequestHandler):
         if length <= 0 or length > 2 * 1024 * 1024:
             raise ValueError('La petición está vacía o es demasiado grande.')
         try:
-            return json.loads(self.rfile.read(length))
+            payload = json.loads(self.rfile.read(length))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError('El cuerpo JSON no es válido.') from exc
+        if not isinstance(payload, dict):
+            raise ValueError('El cuerpo JSON debe ser un objeto.')
+        return payload
 
     def validate_mutating_request(self):
         content_type = self.headers.get('Content-Type', '').partition(';')[0].strip().casefold()
@@ -835,8 +927,6 @@ class H(BaseHTTPRequestHandler):
             self.send_json({'error': 'Se requiere Content-Type application/json.'}, 415)
             return False
         source = self.headers.get('Origin') or self.headers.get('Referer')
-        host = self.headers.get('Host', '')
-        expected = os.environ.get('VIDEOTECA_ORIGIN') or (f'http://{host}' if host else '')
 
         def origin_tuple(value):
             try:
@@ -850,7 +940,18 @@ class H(BaseHTTPRequestHandler):
             except ValueError:
                 return None
 
-        if not source or origin_tuple(source) != origin_tuple(expected):
+        configured = os.environ.get('VIDEOTECA_ALLOWED_ORIGINS') or os.environ.get('VIDEOTECA_ORIGIN')
+        if configured:
+            allowed = {origin_tuple(value.strip()) for value in configured.split(',') if value.strip()}
+        else:
+            port = self.server.server_address[1]
+            allowed = {
+                ('http', '127.0.0.1', port),
+                ('http', 'localhost', port),
+                ('http', '::1', port),
+            }
+        allowed.discard(None)
+        if not source or origin_tuple(source) not in allowed:
             self.send_json({'error': 'Origen de petición no permitido.'}, 403)
             return False
         return True

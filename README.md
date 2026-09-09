@@ -107,7 +107,7 @@ Sin `systemd`, el descargador se ejecuta en un hilo de fondo dentro del proceso 
 5. Pulsa **Añadir a la videoteca**.
 6. Descarga un vídeo concreto o pulsa **Descargar toda la categoría**.
 
-Cada tarjeta incorpora **Organizar / borrar**. Desde ese diálogo puedes marcar varias categorías, mover el vídeo a otras categorías o eliminar su registro. La casilla **Eliminar también el archivo de vídeo y su miniatura del disco** está desmarcada de forma predeterminada y requiere una confirmación adicional antes del borrado. Para evitar archivos huérfanos, no se permite borrar un vídeo mientras su descarga está pendiente o en curso.
+Cada tarjeta incorpora **Organizar / borrar**. Desde ese diálogo puedes marcar varias categorías, mover el vídeo a otras categorías o eliminar su registro. La casilla **Eliminar también el archivo de vídeo y su miniatura del disco** está desmarcada de forma predeterminada y requiere una confirmación adicional antes del borrado. No se permite borrar un vídeo mientras su descarga está pendiente o en curso. Si el sistema operativo impide eliminar un archivo, la limpieza queda registrada y se vuelve a intentar automáticamente.
 
 Añadir un vídeo al catálogo **no lo descarga automáticamente**. Solo se descargan filas encoladas explícitamente.
 
@@ -198,6 +198,8 @@ GitHub Actions compilará Windows y publicará automáticamente una release con:
 | `VIDEOTECA_HOME` | Directorio de datos | Proyecto; `%LOCALAPPDATA%\YTVault` en EXE |
 | `VIDEOTECA_HOST` | Dirección de escucha | `127.0.0.1` |
 | `VIDEOTECA_PORT` | Puerto | `8802` |
+| `VIDEOTECA_ALLOWED_ORIGINS` | Orígenes permitidos para operaciones `POST`, separados por comas | `http://127.0.0.1:<puerto>`, `http://localhost:<puerto>` y `http://[::1]:<puerto>` |
+| `VIDEOTECA_ORIGIN` | Origen único permitido; alias compatible de la variable anterior | Vacío |
 | `VIDEOTECA_DOWNLOADER_SERVICE` | Servicio Linux del descargador | Vacío; hilo integrado |
 | `YOUTUBE_SUCCESS_DELAY` | Pausa tras una descarga correcta | `30` segundos |
 | `YOUTUBE_ERROR_DELAY` | Pausa tras un error | `900` segundos |
@@ -214,7 +216,7 @@ GitHub Actions compilará Windows y publicará automáticamente una release con:
 | `POST` | `/api/download/video` | Encolar un vídeo |
 | `POST` | `/api/download/category` | Encolar una categoría |
 
-La API no incorpora autenticación. Está pensada para uso local o en una LAN de confianza. No expongas el puerto directamente a Internet.
+La API no incorpora autenticación. Está pensada para uso local o en una LAN de confianza. No expongas el puerto directamente a Internet. Las peticiones `POST` requieren `Content-Type: application/json` y un encabezado `Origin` o `Referer` incluido en `VIDEOTECA_ALLOWED_ORIGINS`. Configura esa variable cuando accedas mediante una IP LAN, un dominio o un proxy HTTPS.
 
 ## Desarrollo y pruebas
 

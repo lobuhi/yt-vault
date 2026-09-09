@@ -277,6 +277,93 @@ class PortalFeatureTests(unittest.TestCase):
         self.assertTrue(result["file_errors"])
         with app.con() as c:
             self.assertIsNone(c.execute("SELECT 1 FROM videos WHERE video_id=?", ("dQw4w9WgXcQ",)).fetchone())
+            self.assertGreater(c.execute('SELECT count(*) FROM file_cleanup_queue').fetchone()[0], 0)
+        retried = app.retry_file_cleanup()
+        self.assertTrue(retried['local_deleted'], retried)
+        self.assertFalse(media.exists())
+        with app.con() as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM file_cleanup_queue').fetchone()[0], 0)
+
+    def test_pending_cleanup_never_deletes_a_file_reused_by_a_new_record(self):
+        category = app.create_category('Reutilización segura')
+        video_id = 'dQw4w9WgXcQ'
+        app.add_video_urls(category['id'], video_id)
+        media = app.VIDEOS / 'reused.mp4'
+        media.write_bytes(b'original')
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (media.name, video_id))
+        with patch.object(app, '_unlink_library_file', side_effect=OSError('ocupado')):
+            app.delete_video(video_id, delete_local=True)
+        app.add_video_urls(category['id'], video_id)
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (media.name, video_id))
+        retried = app.retry_file_cleanup()
+        self.assertTrue(retried['file_errors'])
+        self.assertTrue(media.is_file())
+        with app.con() as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM file_cleanup_queue').fetchone()[0], 0)
+
+    def test_pending_cleanup_cancels_case_and_win32_filename_aliases(self):
+        category = app.create_category('Alias Windows')
+        old_video = 'dQw4w9WgXcQ'
+        new_video = 'abcdefghijk'
+        app.add_video_urls(category['id'], old_video)
+        media = app.VIDEOS / 'Movie.mp4'
+        media.write_bytes(b'original')
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (media.name, old_video))
+        with patch.object(app, '_unlink_library_file', side_effect=OSError('ocupado')):
+            app.delete_video(old_video, delete_local=True)
+        app.add_video_urls(category['id'], new_video)
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", ('ＭＯＶＩＥ.MP4. ', new_video))
+        retried = app.retry_file_cleanup()
+        self.assertTrue(retried['file_errors'])
+        self.assertTrue(media.is_file())
+        with app.con() as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM file_cleanup_queue').fetchone()[0], 0)
+
+    def test_cleanup_serializes_filename_reuse_with_unlink(self):
+        category = app.create_category('Carrera de limpieza')
+        video_id = 'dQw4w9WgXcQ'
+        app.add_video_urls(category['id'], video_id)
+        media = app.VIDEOS / 'same.mp4'
+        media.write_bytes(b'old')
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (media.name, video_id))
+        with patch.object(app, '_unlink_library_file', side_effect=OSError('ocupado')):
+            app.delete_video(video_id, delete_local=True)
+        with app.con() as c:
+            c.execute("DELETE FROM file_cleanup_queue WHERE root_kind='thumbs'")
+
+        writer_started = threading.Event()
+        writer_done = threading.Event()
+
+        def reuse_filename():
+            writer_started.set()
+            app.add_video_urls(category['id'], video_id)
+            with app.con() as c:
+                c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (media.name, video_id))
+            media.write_bytes(b'new')
+            writer_done.set()
+
+        real_unlink = app._unlink_library_file
+        writer = None
+
+        def unlink_while_writer_waits(root, filename):
+            nonlocal writer
+            writer = threading.Thread(target=reuse_filename)
+            writer.start()
+            self.assertTrue(writer_started.wait(1))
+            self.assertFalse(writer_done.wait(0.1))
+            return real_unlink(root, filename)
+
+        with patch.object(app, '_unlink_library_file', side_effect=unlink_while_writer_waits):
+            cleaned = app.retry_file_cleanup()
+        writer.join(5)
+        self.assertFalse(writer.is_alive())
+        self.assertTrue(cleaned['local_deleted'], cleaned)
+        self.assertEqual(media.read_bytes(), b'new')
 
     def test_queue_video_and_whole_category_skip_downloaded_items(self):
         category = app.create_category("Descargas")
@@ -358,6 +445,14 @@ class PortalFeatureTests(unittest.TestCase):
         self.assertIn('name="managed_categories"', page)
         self.assertIn("file_errors.join('\\n')", page)
         self.assertIn(f'data-download-category="{category["id"]}"', page)
+
+    def test_watch_page_shows_all_video_categories(self):
+        first = app.create_category('Primera categoría')
+        second = app.create_category('Segunda categoría')
+        app.add_video_urls(first['id'], 'dQw4w9WgXcQ')
+        app.set_video_categories('dQw4w9WgXcQ', [first['id'], second['id']])
+        page = app.watch_page('dQw4w9WgXcQ')
+        self.assertIn('Primera categoría, Segunda categoría', page)
 
     def test_json_api_creates_adds_and_queues(self):
         server = ThreadingHTTPServer(('127.0.0.1', 0), app.H)
@@ -483,6 +578,33 @@ class PortalFeatureTests(unittest.TestCase):
             with self.assertRaises(error.HTTPError) as rejected_scheme:
                 request.urlopen(wrong_scheme, timeout=5)
             self.assertEqual(rejected_scheme.exception.code, 403)
+
+            rebinding = request.Request(
+                url,
+                data=b'{"name":"Rebinding"}',
+                headers={
+                    'Content-Type': 'application/json',
+                    'Host': 'attacker.example',
+                    'Origin': 'http://attacker.example',
+                },
+                method='POST',
+            )
+            with self.assertRaises(error.HTTPError) as rejected_rebinding:
+                request.urlopen(rebinding, timeout=5)
+            self.assertEqual(rejected_rebinding.exception.code, 403)
+
+            non_object = request.Request(
+                url,
+                data=b'[]',
+                headers={
+                    'Content-Type': 'application/json',
+                    'Origin': f'http://127.0.0.1:{server.server_port}',
+                },
+                method='POST',
+            )
+            with self.assertRaises(error.HTTPError) as rejected_shape:
+                request.urlopen(non_object, timeout=5)
+            self.assertEqual(rejected_shape.exception.code, 400)
 
             same_origin = request.Request(
                 url,

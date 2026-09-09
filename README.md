@@ -1,48 +1,51 @@
 # YT Vault
 
-Videoteca web local, ligera y sin dependencias de frontend, para organizar enlaces de YouTube por categorías y descargar únicamente los vídeos que el usuario elija.
+**English** · [Español](README.es.md)
+
+A lightweight, local-first web application for organizing YouTube links into categories and downloading only the videos you choose.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Licencia](https://img.shields.io/badge/licencia-MIT-green)
+![License](https://img.shields.io/badge/license-MIT-green)
 ![Windows](https://img.shields.io/badge/Windows-EXE-0078D4?logo=windows)
 
-## Características
+## Features
 
-- Categorías desplegables creadas desde la propia interfaz.
-- Un mismo vídeo puede pertenecer a varias categorías y aparecer en cada una de ellas.
-- Reorganización de categorías desde cada tarjeta mediante selección múltiple.
-- Borrado desde el frontal, conservando el archivo local o eliminándolo también tras confirmación explícita.
-- Alta de vídeos individuales, identificadores de YouTube o playlists completas.
-- Expansión automática de playlists mediante `yt-dlp`.
-- Estados separados: sin descargar, pendiente, descargando, disponible y fallido.
-- Descarga individual o de todos los vídeos pendientes de una categoría.
-- Cola estrictamente secuencial: nunca inicia varias descargas simultáneas.
-- Reproducción local con soporte de peticiones HTTP por rangos.
-- Miniaturas locales generadas con FFmpeg.
-- Enlace directo al vídeo original de YouTube.
-- Búsqueda que ignora tildes y espacios repetidos.
-- Orden numérico natural (`1, 2, 3… 10`, no `1, 10, 2`).
-- Interfaz adaptable a móvil.
-- SQLite: no requiere servidor de base de datos.
-- Sin telemetría, cuentas ni servicios externos aparte de YouTube.
+- Create collapsible categories directly from the interface.
+- Assign one video to multiple categories and display it in each of them.
+- Reorganize categories from every video card using multi-select.
+- Remove a library record while either keeping or explicitly deleting its local files.
+- Add individual videos, YouTube IDs, or complete playlists.
+- Expand playlists automatically with `yt-dlp`.
+- Track separate states: YouTube only, pending, downloading, available, and failed.
+- Download one video or every pending video in a category.
+- Strictly sequential queue: downloads never run concurrently.
+- Play local files with HTTP range-request support.
+- Generate local thumbnails with FFmpeg.
+- Keep a direct link to the original YouTube video.
+- Accent-insensitive search and natural numeric ordering.
+- Modern, responsive dark interface for desktop and mobile.
+- Switch between English and Spanish; the browser remembers the preference.
+- Native Windows system tray icon for opening or shutting down YT Vault.
+- SQLite storage: no database server required.
+- No telemetry, accounts, or external services apart from YouTube.
 
-> El repositorio se distribuye vacío: no contiene vídeos, miniaturas ni bases de datos personales.
+> The repository is distributed empty. It contains no personal videos, thumbnails, or databases.
 
-## Inicio rápido en Linux
+## Quick start on Linux
 
-### Requisitos
+### Requirements
 
-- Python 3.10 o posterior.
+- Python 3.10 or newer.
 - FFmpeg.
-- `systemd --user` es opcional, pero permite dejar la aplicación como servicio persistente.
+- `systemd --user` is optional, but allows the application to run as a persistent service.
 
-En Debian o Ubuntu:
+On Debian or Ubuntu:
 
 ```bash
 sudo apt install python3 python3-venv ffmpeg
 ```
 
-### Instalación automática
+### Automatic installation
 
 ```bash
 git clone https://github.com/lobuhi/yt-vault.git
@@ -51,39 +54,39 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-El instalador:
+The installer:
 
-1. crea `.venv`;
-2. instala `yt-dlp`;
-3. crea una base SQLite vacía;
-4. instala e inicia `yt-vault.service` cuando `systemd --user` está disponible;
-5. utiliza el puerto **8802** de forma predeterminada.
+1. creates `.venv`;
+2. installs `yt-dlp`;
+3. creates an empty SQLite database;
+4. installs and starts `yt-vault.service` when `systemd --user` is available;
+5. uses port **8802** by default.
 
-Abre:
+Open:
 
 ```text
 http://127.0.0.1:8802/
 ```
 
-Desde otro dispositivo de la misma red:
+From another device on the same network:
 
 ```text
-http://IP-DEL-SERVIDOR:8802/
+http://SERVER-IP:8802/
 ```
 
-### Elegir otro puerto
+### Choose another port
 
 ```bash
 PORT=9000 ./setup.sh
 ```
 
-También puede limitarse al equipo local:
+To restrict access to the local machine:
 
 ```bash
 HOST=127.0.0.1 PORT=9000 ./setup.sh
 ```
 
-## Ejecución manual
+## Manual execution
 
 ```bash
 python3 -m venv .venv
@@ -91,146 +94,155 @@ python3 -m venv .venv
 .venv/bin/python app.py --host 127.0.0.1 --port 8802 --open-browser
 ```
 
-Sin `systemd`, el descargador se ejecuta en un hilo de fondo dentro del proceso web. Con la instalación automática de Linux, se usa un servicio separado para que las descargas sobrevivan a un reinicio del portal.
+Without `systemd`, the downloader runs in a background thread inside the web process. The automatic Linux installation uses a separate service so downloads can survive a portal restart.
 
-## Uso
+## Usage
 
-1. Abre **Gestionar videoteca**.
-2. Crea una categoría.
-3. Selecciónala en el formulario de incorporación.
-4. Pega uno o varios elementos:
+1. Open **Manage library**.
+2. Create a category.
+3. Select it in the add-videos form.
+4. Paste one or more of the following:
    - `https://www.youtube.com/watch?v=...`
    - `https://youtu.be/...`
    - `https://www.youtube.com/shorts/...`
-   - una URL de playlist;
-   - un identificador de vídeo.
-5. Pulsa **Añadir a la videoteca**.
-6. Descarga un vídeo concreto o pulsa **Descargar toda la categoría**.
+   - a playlist URL;
+   - a video ID.
+5. Select **Add to library**.
+6. Download an individual video or select **Download entire category**.
 
-Cada tarjeta incorpora **Organizar / borrar**. Desde ese diálogo puedes marcar varias categorías, mover el vídeo a otras categorías o eliminar su registro. La casilla **Eliminar también el archivo de vídeo y su miniatura del disco** está desmarcada de forma predeterminada y requiere una confirmación adicional antes del borrado. No se permite borrar un vídeo mientras su descarga está pendiente o en curso. Si el sistema operativo impide eliminar un archivo, la limpieza queda registrada y se vuelve a intentar automáticamente.
+Each card includes **Manage / delete**. The dialog lets you assign several categories, move the video, or remove its record. **Also delete the video file and thumbnail from disk** is disabled by default and requires an additional confirmation. Pending or active downloads cannot be deleted. If the operating system prevents file removal, cleanup is recorded and retried safely.
 
-Añadir un vídeo al catálogo **no lo descarga automáticamente**. Solo se descargan filas encoladas explícitamente.
+Adding a video to the catalog **does not download it automatically**. Only explicitly queued rows are downloaded.
 
-## Datos y copias de seguridad
+## Data and backups
 
-En una instalación desde código, los datos se guardan dentro del proyecto:
+Source installations store their data inside the project:
 
-| Ruta | Contenido |
+| Path | Contents |
 |---|---|
-| `data/portal.sqlite3` | Catálogo y estados |
-| `videos/` | MP4 descargados |
-| `thumbs/` | Miniaturas JPEG |
-| `tmp/` | Descargas temporales |
-| `logs/downloader.log` | Registro del descargador |
+| `data/portal.sqlite3` | Catalog and status data |
+| `videos/` | Downloaded MP4 files |
+| `thumbs/` | JPEG thumbnails |
+| `tmp/` | Temporary downloads |
+| `logs/downloader.log` | Downloader log |
 
-Para hacer una copia completa, detén temporalmente el servicio y copia esas rutas:
+For a complete backup, temporarily stop the services and copy those paths:
 
 ```bash
 systemctl --user stop yt-vault.service yt-vault-downloader.service
-cp -a data videos thumbs /ruta/de/copia/
+cp -a data videos thumbs /path/to/backup/
 systemctl --user start yt-vault.service
 ```
 
-Estos contenidos están excluidos de Git mediante `.gitignore`.
+These paths are excluded from Git through `.gitignore`.
 
-## Servicios Linux
+## Linux services
 
 ```bash
-# Estado
+# Status
 systemctl --user status yt-vault.service
 systemctl --user status yt-vault-downloader.service
 
-# Reiniciar portal
+# Restart the portal
 systemctl --user restart yt-vault.service
 
-# Registro del portal
+# Portal log
 journalctl --user -u yt-vault.service -f
 
-# Registro de descargas
+# Downloader log
 journalctl --user -u yt-vault-downloader.service -f
 ```
 
-El servicio del descargador aparece normalmente como `inactive` cuando la cola está vacía. Se inicia al pulsar un botón de descarga y termina al completar la cola.
+The downloader service normally appears as `inactive` while the queue is empty. It starts when a download button is selected and exits after finishing the queue.
 
-## Windows y versión `.exe`
+## Windows executable
 
-El proyecto incluye el flujo de GitHub Actions `.github/workflows/build-windows.yml`.
+The repository includes `.github/workflows/build-windows.yml`.
 
-### Generar un ejecutable desde GitHub
+### Download or build
 
-1. Entra en la pestaña **Actions** del repositorio.
-2. Selecciona **Compilar para Windows**.
-3. Pulsa **Run workflow**.
-4. Descarga el artefacto `YTVault-Windows`.
+Download the latest `YTVault.exe` or `YTVault-Windows.zip` from [GitHub Releases](https://github.com/lobuhi/yt-vault/releases). To create a fresh build manually:
 
-El paquete contiene:
+1. Open the repository's **Actions** tab.
+2. Select **Build for Windows** / **Compilar para Windows**.
+3. Select **Run workflow**.
+4. Download the `YTVault-Windows` artifact.
+
+The portable package contains:
 
 - `YTVault.exe`;
 - `yt-dlp.exe`;
-- `ffmpeg.exe`.
+- `ffmpeg.exe` and `ffprobe.exe`;
+- `deno.exe`, the JavaScript runtime recommended by yt-dlp for full YouTube support.
 
-Los tres archivos deben permanecer juntos para poder descargar vídeos. Al abrir `YTVault.exe`, la aplicación usa el puerto 8802 y abre el navegador automáticamente.
+The portable files can remain together and work without a separate installation. The standalone `YTVault.exe` also works by itself: on the first playlist import or queued download, it automatically downloads missing tools into `%LOCALAPPDATA%\YTVault\tools`. Every download uses HTTPS, is checked against the publisher's SHA-256 checksum, and is moved into place only after verification. If installation fails, queued items change to **failed** instead of remaining stuck as pending; details are written to `%LOCALAPPDATA%\YTVault\logs\downloader.log`.
 
-Los datos de Windows se guardan fuera del ejecutable, en:
+Starting `YTVault.exe` uses port 8802 and opens the browser automatically.
+
+### System tray controls
+
+While YT Vault is running, its green icon remains in the **Windows system tray**, next to the clock (it may be inside the hidden-icons menu).
+
+- Double-click the icon to open YT Vault.
+- Right-click and choose **Open YT Vault** to open the interface.
+- Right-click and choose **Exit YT Vault** to stop the local server and fully close the application.
+
+Windows data is stored outside the executable in:
 
 ```text
 %LOCALAPPDATA%\YTVault\
 ```
 
-### Publicar una release automáticamente
+### Publish a release automatically
 
-Crea y sube una etiqueta con formato `v*`:
+Create and push a `v*` tag:
 
 ```bash
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-GitHub Actions compilará Windows y publicará automáticamente una release con:
+GitHub Actions builds Windows and publishes a release containing `YTVault.exe` and `YTVault-Windows.zip`.
 
-- `YTVault.exe`;
-- `YTVault-Windows.zip`, que incluye las herramientas necesarias.
+## Environment variables
 
-## Variables de entorno
-
-| Variable | Uso | Valor predeterminado |
+| Variable | Purpose | Default |
 |---|---|---|
-| `VIDEOTECA_HOME` | Directorio de datos | Proyecto; `%LOCALAPPDATA%\YTVault` en EXE |
-| `VIDEOTECA_HOST` | Dirección de escucha | `127.0.0.1` |
-| `VIDEOTECA_PORT` | Puerto | `8802` |
-| `VIDEOTECA_ALLOWED_ORIGINS` | Orígenes permitidos para operaciones `POST`, separados por comas | `http://127.0.0.1:<puerto>`, `http://localhost:<puerto>` y `http://[::1]:<puerto>` |
-| `VIDEOTECA_ORIGIN` | Origen único permitido; alias compatible de la variable anterior | Vacío |
-| `VIDEOTECA_DOWNLOADER_SERVICE` | Servicio Linux del descargador | Vacío; hilo integrado |
-| `YOUTUBE_SUCCESS_DELAY` | Pausa tras una descarga correcta | `30` segundos |
-| `YOUTUBE_ERROR_DELAY` | Pausa tras un error | `900` segundos |
+| `VIDEOTECA_HOME` | Data directory | Project directory; `%LOCALAPPDATA%\YTVault` in the EXE |
+| `VIDEOTECA_HOST` | Listen address | `127.0.0.1` |
+| `VIDEOTECA_PORT` | Port | `8802` |
+| `VIDEOTECA_ALLOWED_ORIGINS` | Comma-separated origins allowed for `POST` operations | `http://127.0.0.1:<port>`, `http://localhost:<port>`, and `http://[::1]:<port>` |
+| `VIDEOTECA_ORIGIN` | Backward-compatible single-origin alias | Empty |
+| `VIDEOTECA_DOWNLOADER_SERVICE` | Linux downloader service | Empty; integrated thread |
+| `YOUTUBE_SUCCESS_DELAY` | Delay after a successful download | `30` seconds |
 
-## API local
+## Local API
 
-| Método | Ruta | Función |
+| Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/api/videos` | Lista del catálogo |
-| `POST` | `/api/categories` | Crear categoría |
-| `POST` | `/api/videos/add` | Añadir vídeos o playlist |
-| `POST` | `/api/videos/categories` | Sustituir la selección de categorías de un vídeo |
-| `POST` | `/api/videos/delete` | Borrar el registro y, opcionalmente, sus archivos locales |
-| `POST` | `/api/download/video` | Encolar un vídeo |
-| `POST` | `/api/download/category` | Encolar una categoría |
+| `GET` | `/api/videos` | List the catalog |
+| `POST` | `/api/categories` | Create a category |
+| `POST` | `/api/videos/add` | Add videos or a playlist |
+| `POST` | `/api/videos/categories` | Replace a video's category selection |
+| `POST` | `/api/videos/delete` | Remove a record and optionally its local files |
+| `POST` | `/api/download/video` | Queue one video |
+| `POST` | `/api/download/category` | Queue a category |
 
-La API no incorpora autenticación. Está pensada para uso local o en una LAN de confianza. No expongas el puerto directamente a Internet. Las peticiones `POST` requieren `Content-Type: application/json` y un encabezado `Origin` o `Referer` incluido en `VIDEOTECA_ALLOWED_ORIGINS`. Configura esa variable cuando accedas mediante una IP LAN, un dominio o un proxy HTTPS.
+The API has no authentication and is intended for local use or a trusted LAN. Do not expose the port directly to the Internet. `POST` requests require `Content-Type: application/json` and an `Origin` or `Referer` listed in `VIDEOTECA_ALLOWED_ORIGINS`. Configure this variable when using a LAN IP, domain name, or HTTPS proxy.
 
-## Desarrollo y pruebas
+## Development and tests
 
 ```bash
 python3 -W error -m unittest -v
 python3 -m py_compile app.py downloader.py
 ```
 
-La aplicación utiliza únicamente la biblioteca estándar de Python para el servidor web. `yt-dlp` y FFmpeg se invocan como herramientas externas.
+The web server uses only Python's standard library. `yt-dlp` and FFmpeg are invoked as external tools.
 
-## Consideraciones legales
+## Legal notice
 
-Descarga únicamente contenido cuando tengas autorización para hacerlo. El usuario es responsable de cumplir las condiciones del servicio de YouTube, las licencias del contenido y la legislación aplicable.
+Only download content when you are authorized to do so. Users are responsible for complying with YouTube's terms of service, content licenses, and applicable law.
 
-## Licencia
+## License
 
-Publicado bajo la licencia [MIT](LICENSE).
+Released under the [MIT License](LICENSE).

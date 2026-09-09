@@ -1,9 +1,12 @@
 import contextlib
+import inspect
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import threading
+import types
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -90,6 +93,30 @@ class PortalFeatureTests(unittest.TestCase):
         with app.con() as c:
             titles = [r[0] for r in c.execute("SELECT title FROM videos ORDER BY rowid")]
         self.assertEqual(titles, ["Vídeo uno", "Vídeo dos"])
+
+    def test_app_windows_subprocess_options_hide_console(self):
+        options = app.subprocess_options(platform='nt')
+        self.assertEqual(options['stdin'], subprocess.DEVNULL)
+        self.assertEqual(options['creationflags'], getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000))
+        self.assertEqual(options['encoding'], 'utf-8')
+        self.assertEqual(options['errors'], 'replace')
+
+    def test_playlist_rejects_option_injection_and_foreign_hosts(self):
+        for value in (
+            '--exec-before-download=calc.exe&rem?list=PLattack',
+            'https://evil.example/playlist?list=PLattack',
+            'http://www.youtube.com/playlist?list=PLattack',
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'YouTube'):
+                app.expand_youtube_inputs(value, playlist_loader=lambda _url: self.fail('loader called'))
+
+    def test_playlist_command_terminates_options_before_url(self):
+        completed = types.SimpleNamespace(returncode=0, stdout='{"entries":[{"id":"M7lc1UVf-VE"}]}', stderr='')
+        with patch.object(app, 'find_tool', return_value='yt-dlp'), \
+             patch.object(app.subprocess, 'run', return_value=completed) as run:
+            app.load_playlist('https://www.youtube.com/playlist?list=PLsafe12345')
+        self.assertEqual(run.call_args.args[0][-2:], ['--', 'https://www.youtube.com/playlist?list=PLsafe12345'])
+
     def test_video_can_belong_to_multiple_categories(self):
         first = app.create_category("Tafsir")
         second = app.create_category("Ramadán")
@@ -99,7 +126,7 @@ class PortalFeatureTests(unittest.TestCase):
         self.assertEqual(app.video_category_ids("dQw4w9WgXcQ"), [first["id"], second["id"]])
         page = app.landing_page()
         self.assertEqual(page.count('data-manage-video="dQw4w9WgXcQ"'), 2)
-        self.assertIn('Total: 1', page)
+        self.assertIn('<b>1</b>Total', page)
 
     def test_reorganize_video_replaces_its_categories(self):
         first = app.create_category("Primera")
@@ -431,6 +458,43 @@ class PortalFeatureTests(unittest.TestCase):
             self.assertEqual(len(memberships), 1)
             self.assertEqual(c.execute('PRAGMA foreign_key_check').fetchall(), [])
 
+    def test_frontend_uses_the_redesigned_responsive_components(self):
+        css = app.base_css()
+        page = app.landing_page('en')
+        self.assertIn('--accent:#1ed760', css)
+        self.assertIn('.language-switch', css)
+        self.assertIn('.stat', css)
+        self.assertIn('.search-wrap', css)
+        self.assertIn('@media(max-width:650px)', css)
+        self.assertIn('class="brand-mark"', page)
+        self.assertIn('class="stat"', page)
+
+    def test_frontend_can_render_english_and_spanish(self):
+        category = app.create_category('Language course')
+        app.add_video_urls(category['id'], 'dQw4w9WgXcQ')
+        english = app.landing_page('en')
+        spanish = app.landing_page('es')
+        watch = app.watch_page('dQw4w9WgXcQ', 'en')
+        self.assertIn('<html lang="en">', english)
+        self.assertIn('Video library', english)
+        self.assertIn('Search videos', english)
+        self.assertIn('Manage library', english)
+        self.assertIn('Manage / delete', english)
+        self.assertIn('Español', english)
+        self.assertIn('<html lang="es">', spanish)
+        self.assertIn('Gestionar videoteca', spanish)
+        self.assertIn('Back to the library', watch)
+
+    def test_language_switch_has_distinct_mobile_labels_and_current_page(self):
+        css = app.base_css()
+        english = app.landing_page('en')
+        spanish = app.landing_page('es')
+        self.assertIn('content:attr(data-short)', css)
+        self.assertNotIn('::first-letter', css)
+        self.assertIn('data-short="ES"', english)
+        self.assertIn('data-short="EN" aria-current="page"', english)
+        self.assertIn('data-short="ES" aria-current="page"', spanish)
+
     def test_frontend_exposes_management_forms_and_download_actions(self):
         category = app.create_category("Curso nuevo")
         app.add_video_urls(category["id"], "dQw4w9WgXcQ")
@@ -535,6 +599,21 @@ class PortalFeatureTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_http_language_query_renders_english(self):
+        app.init()
+        server = app.ThreadingHTTPServer(('127.0.0.1', 0), app.H)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with request.urlopen(f'http://127.0.0.1:{server.server_port}/?lang=en', timeout=5) as response:
+                page = response.read().decode()
+            self.assertIn('<html lang="en">', page)
+            self.assertIn('Video library', page)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     def test_mutating_api_rejects_non_json_and_cross_origin_requests(self):
         server = ThreadingHTTPServer(('127.0.0.1', 0), app.H)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -617,6 +696,265 @@ class PortalFeatureTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class FakeWin32Function:
+    def __init__(self, implementation=lambda *args: 1):
+        self.implementation = implementation
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self.implementation(*args)
+
+
+class FakeWin32:
+    def __init__(
+        self, event, *, failing_api=None, false_api=None, post_quit_fails=False,
+        track_command=0,
+    ):
+        self.events = list(event) if isinstance(event, list) else [event]
+        self.quit_requested = False
+        self.post_quit_fails = post_quit_fails
+        self.callback = None
+        self.dispatch_results = []
+
+        def register(window_class):
+            self.callback = window_class._obj.lpfnWndProc
+            return 1
+
+        def get_message(message, *_args):
+            if not self.events:
+                return 0
+            hwnd, win_message, wparam, lparam = self.events.pop(0)
+            msg = message._obj
+            msg.hWnd = hwnd
+            msg.message = win_message
+            msg.wParam = wparam
+            msg.lParam = lparam
+            return 1
+
+        def dispatch(message):
+            msg = message._obj
+            result = self.callback(msg.hWnd, msg.message, msg.wParam, msg.lParam)
+            self.dispatch_results.append(result)
+            return result
+
+        def post_quit(_code):
+            if self.post_quit_fails:
+                raise RuntimeError('PostQuitMessage failed')
+            self.quit_requested = True
+
+        def maybe_fail(name, value=1):
+            def implementation(*_args):
+                if failing_api == name:
+                    raise RuntimeError(f'{name} failed')
+                if false_api == name:
+                    return 0
+                return value
+            return implementation
+
+        user32_names = (
+            'RegisterClassW', 'UnregisterClassW', 'CreateWindowExW',
+            'DefWindowProcW', 'CreatePopupMenu', 'AppendMenuW', 'GetCursorPos',
+            'SetForegroundWindow', 'TrackPopupMenu', 'DestroyMenu',
+            'DestroyWindow', 'PostQuitMessage', 'GetMessageW',
+            'TranslateMessage', 'DispatchMessageW', 'LoadImageW', 'DestroyIcon',
+        )
+        self.user32 = types.SimpleNamespace(**{
+            name: FakeWin32Function() for name in user32_names
+        })
+        self.user32.RegisterClassW.implementation = register
+        self.user32.CreateWindowExW.implementation = lambda *_args: 100
+        self.user32.DefWindowProcW.implementation = maybe_fail('DefWindowProcW', 37)
+        self.user32.CreatePopupMenu.implementation = lambda: 200
+        self.user32.GetCursorPos.implementation = maybe_fail('GetCursorPos')
+        self.user32.TrackPopupMenu.implementation = lambda *_args: track_command
+        self.user32.PostQuitMessage.implementation = post_quit
+        self.user32.GetMessageW.implementation = get_message
+        self.user32.DispatchMessageW.implementation = dispatch
+        self.user32.LoadImageW.implementation = lambda *_args: 300
+        for name in ('UnregisterClassW', 'DestroyMenu', 'DestroyWindow', 'DestroyIcon'):
+            getattr(self.user32, name).implementation = maybe_fail(name)
+
+        def shell_notify(command, *_args):
+            if failing_api == 'Shell_NotifyIconW':
+                raise RuntimeError('Shell_NotifyIconW failed')
+            if false_api == 'Shell_NotifyIconW' and command == 2:
+                return 0
+            return 1
+
+        self.shell32 = types.SimpleNamespace(
+            ExtractIconExW=FakeWin32Function(lambda *_args: 0),
+            Shell_NotifyIconW=FakeWin32Function(shell_notify),
+        )
+        self.kernel32 = types.SimpleNamespace(
+            GetModuleHandleW=FakeWin32Function(lambda *_args: 1),
+        )
+        self.windll = types.SimpleNamespace(
+            user32=self.user32, shell32=self.shell32, kernel32=self.kernel32,
+        )
+
+
+class WindowsTrayRegressionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = inspect.getsource(app.WindowsTray.run)
+
+    def test_win32_api_signatures_are_complete_and_pointer_safe(self):
+        APIs = (
+            'GetModuleHandleW', 'RegisterClassW', 'UnregisterClassW',
+            'CreateWindowExW', 'DefWindowProcW', 'CreatePopupMenu',
+            'AppendMenuW', 'GetCursorPos', 'SetForegroundWindow',
+            'TrackPopupMenu', 'DestroyMenu', 'DestroyWindow',
+            'PostQuitMessage', 'GetMessageW', 'TranslateMessage',
+            'DispatchMessageW', 'LoadImageW', 'DestroyIcon',
+            'ExtractIconExW', 'Shell_NotifyIconW',
+        )
+        for api in APIs:
+            with self.subTest(api=api):
+                self.assertIn(f'{api}.argtypes =', self.source)
+                self.assertIn(f'{api}.restype =', self.source)
+        self.assertIn(
+            'wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR',
+            self.source,
+        )
+        self.assertIn('wintypes.HWND, ctypes.POINTER(wintypes.RECT)', self.source)
+        self.assertIn('user32.TrackPopupMenu.restype = wintypes.BOOL', self.source)
+
+    def test_message_error_is_not_treated_as_normal_shutdown(self):
+        error_check = self.source.index('if result == -1:')
+        winerror = self.source.index('raise ctypes.WinError()', error_check)
+        normal_shutdown = self.source.index('if result == 0:', winerror)
+        self.assertLess(error_check, winerror)
+        self.assertLess(winerror, normal_shutdown)
+
+    def test_lifetime_cleanup_is_centralized_and_idempotent(self):
+        finally_block = self.source.rsplit('        finally:', 1)[1]
+        expected_cleanup = (
+            'remove_tray_icon()', 'destroy_window()', 'release_owned_icons()',
+            'cleanup_bool(user32.UnregisterClassW, class_name, instance)',
+        )
+        positions = [finally_block.index(call) for call in expected_cleanup]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('self._nid = None', self.source)
+        self.assertIn('self._hwnd = None', self.source)
+        self.assertIn('self._owned_icons = []', self.source)
+        self.assertEqual(self.source.count('cleanup_bool(user32.DestroyIcon'), 1)
+        self.assertLess(
+            self.source.index('if not shell32.Shell_NotifyIconW(NIM_ADD'),
+            self.source.index('self._nid = nid'),
+        )
+
+    def test_popup_menu_has_unconditional_release(self):
+        show_menu = self.source[
+            self.source.index('        def show_menu'):
+            self.source.index('        @WNDPROC')
+        ]
+        self.assertIn('finally:', show_menu)
+        self.assertIn('user32.DestroyMenu(menu)', show_menu)
+
+    def run_tray_event(self, event, stop=None, **fake_options):
+        import ctypes
+
+        fake = FakeWin32(event, **fake_options)
+        tray = app.WindowsTray('http://127.0.0.1', stop or (lambda: None))
+        with (
+            patch.object(ctypes, 'windll', fake.windll, create=True),
+            patch.object(ctypes, 'WINFUNCTYPE', ctypes.CFUNCTYPE, create=True),
+        ):
+            tray.run()
+        return fake
+
+    def test_cleanup_false_results_are_reported(self):
+        import ctypes
+
+        for api, event in (
+            ('DestroyWindow', (100, 0x0111, 0, 0)),
+            ('Shell_NotifyIconW', (100, 0x0111, 0, 0)),
+            ('UnregisterClassW', (100, 0x0111, 0, 0)),
+            ('DestroyMenu', (100, 0x8001, 0, 0x0205)),
+        ):
+            with self.subTest(api=api), \
+                 patch.object(ctypes, 'WinError', return_value=OSError(f'{api} returned FALSE'), create=True), \
+                 self.assertRaisesRegex(OSError, f'{api} returned FALSE'):
+                self.run_tray_event(event, false_api=api)
+
+    def test_cleanup_false_does_not_mask_callback_error(self):
+        import ctypes
+
+        callback_error = RuntimeError('browser failed')
+        with patch.object(app.webbrowser, 'open', side_effect=callback_error), \
+             patch.object(ctypes, 'WinError', return_value=OSError('cleanup failed'), create=True), \
+             self.assertRaises(RuntimeError) as caught:
+            self.run_tray_event(
+                (100, 0x8001, 0, 0x0203), false_api='DestroyWindow',
+            )
+        self.assertIs(caught.exception, callback_error)
+
+    def test_cleanup_helpers_check_all_bool_results(self):
+        for call in (
+            'shell32.Shell_NotifyIconW, NIM_DELETE',
+            'user32.DestroyWindow, current',
+            'user32.DestroyIcon, owned_icon',
+            'user32.UnregisterClassW, class_name, instance',
+        ):
+            with self.subTest(call=call):
+                self.assertIn(f'cleanup_bool({call}', self.source)
+        self.assertIn('if not user32.DestroyMenu(menu):', self.source)
+
+    def test_open_failure_is_rethrown_after_a_deterministic_callback_return(self):
+        failure = RuntimeError('browser failed')
+        with patch.object(app.webbrowser, 'open', side_effect=failure):
+            with self.assertRaises(RuntimeError) as caught:
+                self.run_tray_event((100, 0x8001, 0, 0x0203))
+        self.assertIs(caught.exception, failure)
+
+    def test_show_menu_and_default_window_proc_failures_are_rethrown(self):
+        cases = (
+            ((100, 0x8001, 0, 0x0205), 'GetCursorPos'),
+            ((100, 0x1234, 0, 0), 'DefWindowProcW'),
+        )
+        for event, failing_api in cases:
+            with self.subTest(failing_api=failing_api):
+                with self.assertRaisesRegex(RuntimeError, f'{failing_api} failed'):
+                    self.run_tray_event(event, failing_api=failing_api)
+
+    def test_callback_error_signaling_is_best_effort(self):
+        failure = RuntimeError('browser failed')
+        fake = FakeWin32((100, 0x8001, 0, 0x0203), post_quit_fails=True)
+        tray = app.WindowsTray('http://127.0.0.1', lambda: None)
+        import ctypes
+        with (
+            patch.object(ctypes, 'windll', fake.windll, create=True),
+            patch.object(ctypes, 'WINFUNCTYPE', ctypes.CFUNCTYPE, create=True),
+            patch.object(app.webbrowser, 'open', side_effect=failure),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            tray.run()
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(fake.dispatch_results, [0])
+        self.assertEqual(len(fake.user32.PostQuitMessage.calls), 1)
+
+    def test_only_the_first_callback_failure_is_rethrown(self):
+        first_failure = RuntimeError('first callback failure')
+        events = [
+            (100, 0x8001, 0, 0x0203),
+            (100, 0x1234, 0, 0),
+        ]
+        with patch.object(app.webbrowser, 'open', side_effect=first_failure):
+            with self.assertRaises(RuntimeError) as caught:
+                self.run_tray_event(events, failing_api='DefWindowProcW')
+        self.assertIs(caught.exception, first_failure)
+
+    def test_exit_command_leaves_server_shutdown_to_run_application(self):
+        stops = []
+        fake = self.run_tray_event(
+            (100, 0x8001, 0, 0x0205), stops.append, track_command=1002,
+        )
+        self.assertTrue(fake.quit_requested)
+        self.assertEqual(fake.dispatch_results, [0])
+        self.assertEqual(stops, [])
 
 
 if __name__ == "__main__":

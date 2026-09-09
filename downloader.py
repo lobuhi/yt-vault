@@ -1,16 +1,36 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import contextlib, json, os, re, shutil, sqlite3, subprocess, sys, time, datetime
+import contextlib, datetime, hashlib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time, urllib.parse, urllib.request, zipfile
 from pathlib import Path
 SOURCE_DIR=Path(__file__).resolve().parent; FROZEN=bool(getattr(sys,'frozen',False)); BINARY_DIR=Path(sys.executable).resolve().parent if FROZEN else SOURCE_DIR
 DEFAULT_ROOT=(Path(os.environ.get('LOCALAPPDATA') or Path.home())/'YTVault') if FROZEN else SOURCE_DIR
-ROOT=Path(os.environ.get('VIDEOTECA_HOME',DEFAULT_ROOT)).expanduser().resolve(); DB=ROOT/'data'/'portal.sqlite3'; VIDEOS=ROOT/'videos'; THUMBS=ROOT/'thumbs'; TMP=ROOT/'tmp'; LOG=ROOT/'logs'/'downloader.log'; SCHEMA="\nCREATE TABLE IF NOT EXISTS videos(\n  video_id TEXT PRIMARY KEY,\n  url TEXT NOT NULL,\n  source TEXT,\n  title TEXT,\n  filename TEXT,\n  status TEXT NOT NULL DEFAULT 'pending',\n  error TEXT,\n  attempts INTEGER NOT NULL DEFAULT 0,\n  duration REAL,\n  filesize INTEGER,\n  priority INTEGER NOT NULL DEFAULT 0,\n  category TEXT,\n  upload_date TEXT,\n  metadata_attempts INTEGER NOT NULL DEFAULT 0,\n  last_metadata_error TEXT,\n  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,\n  created_at TEXT DEFAULT CURRENT_TIMESTAMP\n);\nCREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);\nCREATE INDEX IF NOT EXISTS idx_videos_source ON videos(source);\nCREATE INDEX IF NOT EXISTS idx_videos_priority ON videos(priority DESC, title COLLATE NOCASE);\n"
-# La cola es siempre secuencial. Entre descargas correctas basta una pausa
-# corta; los fallos conservan un backoff mayor para no insistir contra YouTube.
+ROOT=Path(os.environ.get('VIDEOTECA_HOME',DEFAULT_ROOT)).expanduser().resolve(); DB=ROOT/'data'/'portal.sqlite3'; VIDEOS=ROOT/'videos'; THUMBS=ROOT/'thumbs'; TMP=ROOT/'tmp'; LOG=ROOT/'logs'/'downloader.log'; TOOLS=ROOT/'tools'
+WINDOWS_TOOL_URLS={
+    'yt_dlp': (
+        'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe',
+        'https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS',
+    ),
+    'ffmpeg': (
+        'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip',
+        'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256',
+    ),
+    'deno': (
+        'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip',
+        'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip.sha256sum',
+    ),
+}
+MAX_TOOL_DOWNLOAD=300*1024*1024
+_tool_install_lock=threading.Lock()
+SCHEMA="\nCREATE TABLE IF NOT EXISTS videos(\n  video_id TEXT PRIMARY KEY,\n  url TEXT NOT NULL,\n  source TEXT,\n  title TEXT,\n  filename TEXT,\n  status TEXT NOT NULL DEFAULT 'pending',\n  error TEXT,\n  attempts INTEGER NOT NULL DEFAULT 0,\n  duration REAL,\n  filesize INTEGER,\n  priority INTEGER NOT NULL DEFAULT 0,\n  category TEXT,\n  upload_date TEXT,\n  metadata_attempts INTEGER NOT NULL DEFAULT 0,\n  last_metadata_error TEXT,\n  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,\n  created_at TEXT DEFAULT CURRENT_TIMESTAMP\n);\nCREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);\nCREATE INDEX IF NOT EXISTS idx_videos_source ON videos(source);\nCREATE INDEX IF NOT EXISTS idx_videos_priority ON videos(priority DESC, title COLLATE NOCASE);\n"
+# La cola es siempre secuencial. Entre descargas correctas se aplica una pausa
+# corta; los fallos definitivos pasan a error y no bloquean los vídeos siguientes.
 SUCCESS_DELAY=int(os.environ.get('YOUTUBE_SUCCESS_DELAY','30'))
-ERROR_DELAY=int(os.environ.get('YOUTUBE_ERROR_DELAY','900'))
 def log(msg):
-    LOG.parent.mkdir(exist_ok=True); line=f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}\n"; print(line,end='',flush=True); LOG.open('a',encoding='utf-8').write(line)
+    LOG.parent.mkdir(parents=True,exist_ok=True)
+    line=f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}\n"
+    print(line,end='',flush=True)
+    with LOG.open('a',encoding='utf-8') as output:
+        output.write(line)
 @contextlib.contextmanager
 def con():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA busy_timeout=10000')
@@ -50,15 +70,181 @@ def existing_file(vid):
 def transient(err):
     e=(err or '').lower(); return any(x in e for x in ['429','too many requests','rate','timeout','timed out','temporarily','try again','http error 403','forbidden','request limit','unavailable','reset by peer'])
 def sanitize(s): return (re.sub(r'[^A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ._ -]+','',s or '').strip(' ._-')[:130] or 'video')
-def run(cmd, timeout=None): return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
-def tool(name):
-    suffix='.exe' if os.name=='nt' else ''
-    candidates=[shutil.which(name),BINARY_DIR/f'{name}{suffix}',SOURCE_DIR/'.venv'/('Scripts' if os.name=='nt' else 'bin')/f'{name}{suffix}']
-    for candidate in candidates:
+def run(cmd, timeout=None, platform=None):
+    platform=platform or os.name
+    creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0x08000000) if platform=='nt' else 0
+    return subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        capture_output=True,
+        timeout=timeout,
+        creationflags=creationflags,
+    )
+
+def _expected_sha256(payload, filename):
+    text=payload.decode('ascii','strict')
+    candidates=[]
+    for line in text.splitlines():
+        match=re.search(r'(?i)\b([0-9a-f]{64})\b',line)
+        if match:
+            candidates.append((match.group(1).lower(),line.casefold()))
+    wanted=filename.casefold()
+    for digest,line in candidates:
+        if wanted in line:
+            return digest
+    if len(candidates)==1:
+        return candidates[0][0]
+    raise RuntimeError(f'No se encontró el SHA-256 de {filename}')
+
+class HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.casefold() != 'https':
+            raise RuntimeError(f'Redirección no HTTPS bloqueada: {newurl}')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_https(opener, url, timeout=120):
+    if urllib.parse.urlsplit(url).scheme.casefold() != 'https':
+        raise RuntimeError(f'La descarga requiere HTTPS: {url}')
+    request=urllib.request.Request(url,headers={'User-Agent':'YTVault/1.0'})
+    response=opener(request,timeout=timeout)
+    final_url=response.geturl()
+    if urllib.parse.urlsplit(final_url).scheme.casefold()!='https':
+        response.close()
+        raise RuntimeError(f'Redirección no segura al descargar {url}')
+    return response
+
+def _read_limited(response, maximum):
+    declared=response.headers.get('Content-Length')
+    if declared:
+        try:
+            if int(declared)>maximum:
+                raise RuntimeError('La descarga supera el tamaño permitido')
+        except ValueError as exc:
+            raise RuntimeError('Content-Length no válido') from exc
+    chunks=[]; total=0
+    while True:
+        chunk=response.read(min(1024*1024,maximum-total+1))
+        if not chunk:
+            return b''.join(chunks)
+        total+=len(chunk)
+        if total>maximum:
+            raise RuntimeError('La descarga supera el tamaño permitido')
+        chunks.append(chunk)
+
+def _download_verified(opener, url, checksum_url, target, checksum_name):
+    with _open_https(opener,checksum_url,30) as response:
+        expected=_expected_sha256(_read_limited(response,1024*1024),checksum_name)
+    digest=hashlib.sha256(); total=0
+    with _open_https(opener,url,300) as response, target.open('wb') as output:
+        declared=response.headers.get('Content-Length')
+        if declared:
+            try:
+                if int(declared)>MAX_TOOL_DOWNLOAD:
+                    raise RuntimeError('La descarga supera el tamaño permitido')
+            except ValueError as exc:
+                raise RuntimeError('Content-Length no válido') from exc
+        while True:
+            chunk=response.read(1024*1024)
+            if not chunk:
+                break
+            total+=len(chunk)
+            if total>MAX_TOOL_DOWNLOAD:
+                raise RuntimeError('La descarga supera el tamaño permitido')
+            digest.update(chunk); output.write(chunk)
+    if digest.hexdigest()!=expected:
+        target.unlink(missing_ok=True)
+        raise RuntimeError(f'Falló la verificación SHA-256 de {checksum_name}')
+
+def _extract_executable(archive_path, executable, target):
+    with zipfile.ZipFile(archive_path) as archive:
+        members=[item for item in archive.infolist() if Path(item.filename).name.casefold()==executable.casefold()]
+        if len(members)!=1:
+            raise RuntimeError(f'No se encontró una única copia de {executable} en el ZIP')
+        member=members[0]
+        if member.is_dir() or member.file_size>MAX_TOOL_DOWNLOAD:
+            raise RuntimeError(f'Entrada ZIP no válida para {executable}')
+        with archive.open(member) as source, target.open('wb') as output:
+            shutil.copyfileobj(source,output,1024*1024)
+
+def install_windows_tools(tools_dir=TOOLS, opener=None, urls=None, required=None):
+    opener=opener or urllib.request.build_opener(HTTPSOnlyRedirectHandler()).open
+    urls=WINDOWS_TOOL_URLS if urls is None else urls
+    required=set(urls) if required is None else set(required)
+    unknown=required-set(urls)
+    if unknown:
+        raise ValueError(f'Herramientas desconocidas: {", ".join(sorted(unknown))}')
+    tools_dir=Path(tools_dir); tools_dir.mkdir(parents=True,exist_ok=True)
+    installed=[]
+    with _tool_install_lock:
+        with tempfile.TemporaryDirectory(prefix='.install-',dir=tools_dir) as temp_name:
+            staging=Path(temp_name); prepared={}
+            if 'yt_dlp' in required and not (tools_dir/'yt-dlp.exe').is_file():
+                archive=staging/'yt-dlp.exe'
+                _download_verified(opener,*urls['yt_dlp'],archive,'yt-dlp.exe')
+                prepared['yt-dlp']=archive
+            if 'ffmpeg' in required and (not (tools_dir/'ffmpeg.exe').is_file() or not (tools_dir/'ffprobe.exe').is_file()):
+                archive=staging/'ffmpeg.zip'
+                _download_verified(opener,*urls['ffmpeg'],archive,'ffmpeg.zip')
+                for name in ('ffmpeg.exe','ffprobe.exe'):
+                    extracted=staging/name
+                    _extract_executable(archive,name,extracted)
+                    prepared[name.removesuffix('.exe')]=extracted
+            if 'deno' in required and not (tools_dir/'deno.exe').is_file():
+                archive=staging/'deno.zip'
+                _download_verified(opener,*urls['deno'],archive,'deno-x86_64-pc-windows-msvc.zip')
+                extracted=staging/'deno.exe'
+                _extract_executable(archive,'deno.exe',extracted)
+                prepared['deno']=extracted
+            for name,source in prepared.items():
+                os.replace(source,tools_dir/f'{name}.exe')
+                installed.append(name)
+    return installed
+
+def _tool_candidates(name, platform, frozen=False):
+    suffix='.exe' if platform=='nt' else ''
+    managed=[TOOLS/f'{name}{suffix}',BINARY_DIR/f'{name}{suffix}']
+    external=[
+        Path.home()/'.local'/'bin'/f'{name}{suffix}',
+        SOURCE_DIR/'.venv'/('Scripts' if platform=='nt' else 'bin')/f'{name}{suffix}',
+        shutil.which(name),
+    ]
+    return managed+external if platform=='nt' and frozen else [external[-1],*managed,*external[:-1]]
+
+def tool(name, platform=None, frozen=None, installer=None):
+    platform=platform or os.name; frozen=FROZEN if frozen is None else frozen
+    for candidate in _tool_candidates(name,platform,frozen):
         if candidate and Path(candidate).is_file(): return str(candidate)
-    raise RuntimeError(f'No se encontró {name}. Consulta el README.')
+    if platform=='nt' and frozen:
+        if installer:
+            installer()
+        else:
+            component={'yt-dlp':'yt_dlp','ffmpeg':'ffmpeg','ffprobe':'ffmpeg','deno':'deno'}.get(name,name)
+            install_windows_tools(required={component})
+        for candidate in _tool_candidates(name,platform,frozen):
+            if candidate and Path(candidate).is_file(): return str(candidate)
+    raise RuntimeError(f'No se encontró {name}. Consulta el registro {LOG}.')
+
 def ytdlp(): return tool('yt-dlp')
 def ffmpeg(): return tool('ffmpeg')
+def ffprobe(): return tool('ffprobe')
+def javascript_runtime(required=True):
+    errors=[]
+    for name in ('deno','node','quickjs','bun'):
+        try: return name,tool(name)
+        except Exception as exc: errors.append(str(exc))
+    if required:
+        raise RuntimeError('No se encontró un runtime JavaScript compatible (Deno, Node, QuickJS o Bun)')
+    return None
+def ensure_runtime_tools(platform=None, frozen=None):
+    platform=platform or os.name; frozen=FROZEN if frozen is None else frozen
+    ytdlp(); ffmpeg(); ffprobe()
+    if platform=='nt' and frozen:
+        javascript_runtime()
+
 def make_thumbnail(video, vid):
     """Crea un JPEG ligero para que la portada nunca tenga que abrir el MP4."""
     target=THUMBS/f'{vid}.jpg'
@@ -75,17 +261,15 @@ def make_thumbnail(video, vid):
     os.replace(tmp,target)
     return target
 def common():
-    # YouTube empezó a devolver 403 con el cliente por defecto en descargas
-    # directas. El cliente Android sigue entregando URLs descargables en los
-    # vídeos probados; mantenerlo como extractor por defecto evita que la cola
-    # se quede bloqueada reintentando el mismo 403 cada hora.
-    return [
-        ytdlp(),
-        '--js-runtimes','node:/usr/bin/node',
-        '--remote-components','ejs:github',
-        '--extractor-args','youtube:player_client=android',
-        '--no-playlist',
-    ]
+    command=[ytdlp()]
+    runtime=javascript_runtime(required=False)
+    if runtime:
+        runtime_name,runtime_path=runtime
+        command.extend([
+            '--js-runtimes',f'{runtime_name}:{runtime_path}',
+        ])
+    command.append('--no-playlist')
+    return command
 def classify(title, source):
     t=(title or '').lower(); s=(source or '').lower()
     arabic_words=['árabe','arabe','arabic','العربية','اللغة العربية','nahw','نحو','sarf','صرف','gramática árabe','gramatica arabe','clase de árabe','curso de árabe','lección de árabe','leccion de arabe']
@@ -110,7 +294,12 @@ def fetch_metadata(r):
 def metadata_phase():
     log('Fase 1: obteniendo títulos de los vídeos en cola')
     for r in rows("select * from videos where status='pending' order by source, video_id"):
-        fetch_metadata(r)
+        try:
+            fetch_metadata(r)
+        except Exception as exc:
+            error=f'{type(exc).__name__}: {exc}'[-2000:]
+            update(r['video_id'],last_metadata_error=error)
+            log(f"AVISO metadatos {r['video_id']}: {error}")
     # recalcular prioridad de todos los que ya tienen título
     with con() as c:
         for r in c.execute('select video_id,title,source from videos').fetchall():
@@ -147,7 +336,23 @@ def download_one(r):
     except Exception as e: log(f'AVISO miniatura {vid}: {e}')
     update(vid,status='done',title=title,filename=final.name,filesize=final.stat().st_size,error=None)
 def main():
-    init(); log(f'Downloader/priorizador iniciado: secuencial, pausa OK={SUCCESS_DELAY}s, pausa error={ERROR_DELAY}s')
+    init(); log(f'Downloader/priorizador iniciado: secuencial, pausa OK={SUCCESS_DELAY}s')
+    initial_items=pending()
+    if not initial_items:
+        log('Cola completa; saliendo'); return
+    initial_ids=[item['video_id'] for item in initial_items]
+    try:
+        ensure_runtime_tools()
+    except Exception as exc:
+        message=f'No se pudieron instalar o localizar yt-dlp, FFmpeg y Deno: {exc}'
+        placeholders=','.join('?' for _ in initial_ids)
+        with con() as c:
+            c.execute(
+                f"UPDATE videos SET status='error', error=?, updated_at=CURRENT_TIMESTAMP WHERE status='pending' AND video_id IN ({placeholders})",
+                (message[-4000:],*initial_ids),
+            )
+        log(f'ERROR dependencias: {message}')
+        raise RuntimeError(message) from exc
     metadata_phase()
     while True:
         items=pending()
@@ -156,10 +361,8 @@ def main():
         try:
             log(f"Descargando {r['video_id']} prioridad={r['priority']} categoría={r['category']} título={r['title'] or ''}")
             download_one(r); log(f"OK {r['video_id']}; esperando {SUCCESS_DELAY}s antes del siguiente vídeo")
-            delay=SUCCESS_DELAY
         except Exception as e:
             err=str(e)[-4000:]; log(f"ERROR {r['video_id']}: {err[:300].replace(chr(10),' ')}"); update(r['video_id'],status='error',error=err)
-            log(f'Esperando {ERROR_DELAY}s antes del siguiente intento/vídeo')
-            delay=ERROR_DELAY
-        time.sleep(delay)
+            continue
+        time.sleep(SUCCESS_DELAY)
 if __name__=='__main__': main()

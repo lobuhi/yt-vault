@@ -36,29 +36,71 @@ jobs:
             --noconsole `
             --clean `
             --name YTVault `
+            --icon "assets/yt-vault.ico" `
             --hidden-import downloader `
             --add-data "seed_urls.json;." `
             app.py
 
-      - name: Descargar herramientas multimedia
+      - name: Descargar y verificar herramientas multimedia
         shell: pwsh
         run: |
+          function Assert-Sha256($Path, $ChecksumPath, $AssetName) {
+            $lines = Get-Content $ChecksumPath
+            if ($AssetName) {
+              $lines = $lines | Where-Object { $_ -match [regex]::Escape($AssetName) }
+            }
+            $checksumMatch = $null
+            foreach ($line in $lines) {
+              $candidate = [regex]::Match($line, '[0-9a-fA-F]{64}')
+              if ($candidate.Success) {
+                $checksumMatch = $candidate
+                break
+              }
+            }
+            if (-not $checksumMatch) { throw "No se encontró SHA-256 para $AssetName" }
+            $actual = (Get-FileHash -Algorithm SHA256 $Path).Hash.ToLowerInvariant()
+            if ($actual -ne $checksumMatch.Value.ToLowerInvariant()) {
+              throw "SHA-256 incorrecto para $Path"
+            }
+          }
+
           Invoke-WebRequest `
             -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
             -OutFile "dist/yt-dlp.exe"
           Invoke-WebRequest `
+            -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS" `
+            -OutFile "yt-dlp.sha256"
+          Assert-Sha256 "dist/yt-dlp.exe" "yt-dlp.sha256" "yt-dlp.exe"
+
+          Invoke-WebRequest `
             -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
             -OutFile "ffmpeg.zip"
+          Invoke-WebRequest `
+            -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256" `
+            -OutFile "ffmpeg.sha256"
+          Assert-Sha256 "ffmpeg.zip" "ffmpeg.sha256" ""
           Expand-Archive "ffmpeg.zip" -DestinationPath "ffmpeg-build"
-          $ffmpeg = Get-ChildItem "ffmpeg-build" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
-          if (-not $ffmpeg) { throw "No se encontró ffmpeg.exe en el paquete descargado" }
-          Copy-Item $ffmpeg.FullName "dist/ffmpeg.exe"
+          foreach ($name in "ffmpeg.exe", "ffprobe.exe") {
+            $binary = Get-ChildItem "ffmpeg-build" -Recurse -Filter $name | Select-Object -First 1
+            if (-not $binary) { throw "No se encontró $name en el paquete descargado" }
+            Copy-Item $binary.FullName "dist/$name"
+          }
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" `
+            -OutFile "deno.zip"
+          Invoke-WebRequest `
+            -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip.sha256sum" `
+            -OutFile "deno.sha256"
+          Assert-Sha256 "deno.zip" "deno.sha256" ""
+          Expand-Archive "deno.zip" -DestinationPath "deno-build"
+          Copy-Item "deno-build/deno.exe" "dist/deno.exe"
 
       - name: Crear paquete portable
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path "dist/YTVault.exe", "dist/yt-dlp.exe", "dist/ffmpeg.exe" `
+            -Path "dist/YTVault.exe", "dist/yt-dlp.exe", "dist/ffmpeg.exe", "dist/ffprobe.exe", "dist/deno.exe" `
             -DestinationPath "dist/YTVault-Windows.zip"
 
       - name: Guardar artefacto

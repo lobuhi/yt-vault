@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -116,6 +117,9 @@ def init():
         c.execute('CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_videos_source ON videos(source)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_videos_priority ON videos(priority DESC, title COLLATE NOCASE)')
+        c.execute('''UPDATE videos SET category_id=NULL
+                     WHERE category_id IS NOT NULL
+                       AND NOT EXISTS (SELECT 1 FROM categories WHERE id=videos.category_id)''')
         for video in c.execute('SELECT * FROM videos WHERE category_id IS NULL').fetchall():
             name = display_group(video)
             c.execute('INSERT OR IGNORE INTO categories(name) VALUES(?)', (name,))
@@ -279,12 +283,129 @@ def set_video_categories(video_id, category_ids):
     return selected
 
 
-def _safe_library_path(root, filename):
-    candidate = Path(filename)
-    candidate = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
-    if not candidate.is_relative_to(root.resolve()):
+def _safe_library_name(filename):
+    name = str(filename or '')
+    if not name or name in ('.', '..') or Path(name).name != name or '/' in name or '\\' in name:
         raise ValueError('El archivo local no tiene una ruta segura dentro de la videoteca.')
-    return candidate
+    return name
+
+
+def _verified_library_root(root):
+    root = Path(root)
+    absolute = Path(os.path.abspath(root))
+    info = os.lstat(absolute)
+    reparse_flag = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
+    if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & reparse_flag:
+        raise OSError('El directorio de la videoteca es un enlace o punto de reanálisis no permitido.')
+    resolved = absolute.resolve(strict=True)
+    if os.path.normcase(str(resolved)) != os.path.normcase(str(absolute)) or not absolute.is_dir():
+        raise OSError('El directorio de la videoteca no es una raíz segura.')
+    return absolute
+
+
+def _windows_unlink_from_root(root, name):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    final_path = kernel32.GetFinalPathNameByHandleW
+    final_path.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    final_path.restype = wintypes.DWORD
+    set_info = kernel32.SetFileInformationByHandle
+    set_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    set_info.restype = wintypes.BOOL
+
+    delete_access = 0x00010000
+    read_attributes = 0x00000080
+    share_all = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    backup_semantics = 0x02000000
+    open_reparse_point = 0x00200000
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    def open_path(path, access, flags):
+        handle = create_file(str(path), access, share_all, None, open_existing, flags, None)
+        if handle == invalid_handle:
+            code = ctypes.get_last_error()
+            if code in (2, 3):
+                return None
+            raise ctypes.WinError(code)
+        return handle
+
+    def opened_path(handle):
+        size = final_path(handle, None, 0, 0)
+        if not size:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        if not final_path(handle, buffer, len(buffer), 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+        value = buffer.value
+        if value.startswith('\\\\?\\UNC\\'):
+            value = '\\\\' + value[8:]
+        elif value.startswith('\\\\?\\'):
+            value = value[4:]
+        return Path(value)
+
+    root_handle = open_path(root, read_attributes, backup_semantics | open_reparse_point)
+    if root_handle is None:
+        raise OSError('El directorio de la videoteca no existe.')
+    try:
+        root_opened = opened_path(root_handle)
+        file_handle = open_path(root / name, delete_access | read_attributes, open_reparse_point)
+        if file_handle is None:
+            return False
+        try:
+            file_opened = opened_path(file_handle)
+            if os.path.normcase(str(file_opened.parent)) != os.path.normcase(str(root_opened)):
+                raise OSError('El archivo local no pertenece a la raíz abierta de la videoteca.')
+
+            class FileDispositionInfo(ctypes.Structure):
+                _fields_ = [('DeleteFile', wintypes.BOOL)]
+
+            disposition = FileDispositionInfo(True)
+            if not set_info(file_handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return True
+        finally:
+            close_handle(file_handle)
+    finally:
+        close_handle(root_handle)
+
+
+def _unlink_library_file(root, filename):
+    name = _safe_library_name(filename)
+    root = _verified_library_root(root)
+    if os.name == 'nt':
+        return _windows_unlink_from_root(root, name)
+    if os.unlink not in os.supports_dir_fd:
+        try:
+            (root / name).unlink()
+            return True
+        except FileNotFoundError:
+            return False
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    directory_fd = os.open(root, flags)
+    try:
+        opened = os.fstat(directory_fd)
+        current = os.stat(root, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise OSError('La raíz de la videoteca cambió durante el borrado.')
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+            return True
+        except FileNotFoundError:
+            return False
+    finally:
+        os.close(directory_fd)
 
 
 def delete_video(video_id, delete_local=False):
@@ -294,27 +415,40 @@ def delete_video(video_id, delete_local=False):
         video = c.execute('SELECT * FROM videos WHERE video_id=?', (video_id,)).fetchone()
         if not video:
             raise ValueError('El vídeo no existe.')
+        if video['status'] in ('pending', 'running'):
+            raise ValueError('No se puede borrar mientras la descarga está pendiente o en curso.')
         shared_file = bool(video['filename'] and c.execute(
             'SELECT 1 FROM videos WHERE video_id<>? AND filename=?',
             (video_id, video['filename']),
         ).fetchone())
-
-    paths = []
-    if delete_local:
-        if video['filename'] and not shared_file:
-            paths.append(_safe_library_path(VIDEOS, video['filename']))
-        paths.append(_safe_library_path(THUMBS, f'{video_id}.jpg'))
+        files = []
+        if delete_local:
+            if video['filename'] and not shared_file:
+                files.append((VIDEOS, _safe_library_name(video['filename'])))
+            files.append((THUMBS, _safe_library_name(f'{video_id}.jpg')))
+        deleted = c.execute(
+            "DELETE FROM videos WHERE video_id=? AND status NOT IN ('pending','running')",
+            (video_id,),
+        )
+        if deleted.rowcount != 1:
+            current = c.execute('SELECT status FROM videos WHERE video_id=?', (video_id,)).fetchone()
+            if current and current['status'] in ('pending', 'running'):
+                raise ValueError('No se puede borrar mientras la descarga está pendiente o en curso.')
+            raise ValueError('El vídeo ya no existe.')
 
     local_deleted = False
-    for path in paths:
-        if path.is_file():
-            path.unlink()
-            local_deleted = True
-
-    with con() as c:
-        c.execute('DELETE FROM video_categories WHERE video_id=?', (video_id,))
-        c.execute('DELETE FROM videos WHERE video_id=?', (video_id,))
-    return {'deleted': True, 'local_deleted': local_deleted, 'shared_file_kept': shared_file}
+    file_errors = []
+    for root, filename in files:
+        try:
+            local_deleted = _unlink_library_file(root, filename) or local_deleted
+        except OSError as exc:
+            file_errors.append(f'{filename}: {exc}')
+    return {
+        'deleted': True,
+        'local_deleted': local_deleted,
+        'shared_file_kept': shared_file,
+        'file_errors': file_errors,
+    }
 
 
 def queue_video(video_id):
@@ -462,8 +596,29 @@ def rows():
                               LEFT JOIN video_categories vc ON vc.video_id=v.video_id
                               LEFT JOIN categories c ON c.id=vc.category_id''').fetchall()
     return sorted(result, key=lambda r: (
-        group_order(display_group(r)), natural_key(r['title'] or r['video_id'])
+        group_order(display_group(r)),
+        natural_key(r['title'] or r['video_id']),
+        r['video_id'],
     ))
+
+
+def api_video_rows():
+    with con() as c:
+        videos = [dict(row) for row in c.execute('SELECT * FROM videos ORDER BY rowid').fetchall()]
+        memberships = c.execute('''SELECT vc.video_id, vc.category_id, c.name
+                                    FROM video_categories vc
+                                    JOIN categories c ON c.id=vc.category_id
+                                    ORDER BY vc.video_id, vc.category_id''').fetchall()
+    categories_by_video = {}
+    for membership in memberships:
+        categories_by_video.setdefault(membership['video_id'], []).append({
+            'id': membership['category_id'], 'name': membership['name'],
+        })
+    for video in videos:
+        categories = categories_by_video.get(video['video_id'], [])
+        video['category_ids'] = [category['id'] for category in categories]
+        video['categories'] = categories
+    return videos
 
 
 def get_video(video_id):
@@ -605,7 +760,7 @@ function showDialogError(text=''){videoDialogError.textContent=text;videoDialogE
 document.addEventListener('click',event=>{const button=event.target.closest('[data-manage-video]');if(!button)return;const selected=new Set(button.dataset.categoryIds.split(',').filter(Boolean));videoManageForm.elements.video_id.value=button.dataset.manageVideo;document.querySelector('#managedVideoTitle').textContent=button.dataset.videoTitle;videoManageForm.querySelectorAll('[name="managed_categories"]').forEach(input=>{input.checked=selected.has(input.value);});document.querySelector('#deleteLocal').checked=false;showDialogError();videoDialog.showModal();});
 document.querySelector('[data-close-video-dialog]').addEventListener('click',()=>videoDialog.close());
 videoManageForm.addEventListener('submit',async event=>{event.preventDefault();const button=event.submitter;const categoryIds=[...videoManageForm.querySelectorAll('[name="managed_categories"]:checked')].map(input=>Number(input.value));if(!categoryIds.length){showDialogError('Selecciona al menos una categoría.');return;}button.disabled=true;try{await postJson('/api/videos/categories',{video_id:videoManageForm.elements.video_id.value,category_ids:categoryIds});location.reload();}catch(error){showDialogError(error.message);button.disabled=false;}});
-document.querySelector('#deleteVideoButton').addEventListener('click',async event=>{const deleteLocal=document.querySelector('#deleteLocal').checked;const message=deleteLocal?'Se borrará el vídeo de la videoteca Y TAMBIÉN su archivo local. ¿Continuar?':'Se borrará el vídeo de la videoteca, pero se conservará el archivo local. ¿Continuar?';if(!confirm(message))return;const button=event.currentTarget;button.disabled=true;try{await postJson('/api/videos/delete',{video_id:videoManageForm.elements.video_id.value,delete_local:deleteLocal});location.reload();}catch(error){showDialogError(error.message);button.disabled=false;}});
+document.querySelector('#deleteVideoButton').addEventListener('click',async event=>{const deleteLocal=document.querySelector('#deleteLocal').checked;const message=deleteLocal?'Se borrará el vídeo de la videoteca Y TAMBIÉN su archivo local. ¿Continuar?':'Se borrará el vídeo de la videoteca, pero se conservará el archivo local. ¿Continuar?';if(!confirm(message))return;const button=event.currentTarget;button.disabled=true;try{const result=await postJson('/api/videos/delete',{video_id:videoManageForm.elements.video_id.value,delete_local:deleteLocal});if(result.file_errors?.length)alert(`El registro se borró, pero algunos archivos no pudieron eliminarse:\\n${result.file_errors.join('\\n')}`);location.reload();}catch(error){showDialogError(error.message);button.disabled=false;}});
 document.addEventListener('click',async event=>{
   const videoButton=event.target.closest('[data-download-video]'), categoryButton=event.target.closest('[data-download-category]');
   if(!videoButton&&!categoryButton)return;
@@ -663,9 +818,37 @@ class H(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError('El cuerpo JSON no es válido.') from exc
 
+    def validate_mutating_request(self):
+        content_type = self.headers.get('Content-Type', '').partition(';')[0].strip().casefold()
+        if content_type != 'application/json':
+            self.send_json({'error': 'Se requiere Content-Type application/json.'}, 415)
+            return False
+        source = self.headers.get('Origin') or self.headers.get('Referer')
+        host = self.headers.get('Host', '')
+        expected = os.environ.get('VIDEOTECA_ORIGIN') or (f'http://{host}' if host else '')
+
+        def origin_tuple(value):
+            try:
+                parsed = urllib.parse.urlparse(value)
+                if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+                    return None
+                if parsed.username is not None or parsed.password is not None:
+                    return None
+                default_port = 443 if parsed.scheme == 'https' else 80
+                return parsed.scheme, parsed.hostname.casefold(), parsed.port or default_port
+            except ValueError:
+                return None
+
+        if not source or origin_tuple(source) != origin_tuple(expected):
+            self.send_json({'error': 'Origen de petición no permitido.'}, 403)
+            return False
+        return True
+
     def do_POST(self):
-        init()
         path = urllib.parse.urlparse(self.path).path
+        if not self.validate_mutating_request():
+            return
+        init()
         try:
             payload = self.read_json()
             if path == '/api/categories':
@@ -705,7 +888,7 @@ class H(BaseHTTPRequestHandler):
     def serve_media(self, path, head_only=False):
         name = urllib.parse.unquote(path.removeprefix('/media/'))
         file_path = (VIDEOS / name).resolve()
-        if not str(file_path).startswith(str(VIDEOS.resolve())) or not file_path.is_file():
+        if not file_path.is_relative_to(VIDEOS.resolve()) or not file_path.is_file():
             self.send_error(404)
             return
         size = file_path.stat().st_size
@@ -776,7 +959,7 @@ class H(BaseHTTPRequestHandler):
                 self.send_bytes(page.encode(), 'text/html; charset=utf-8')
             return
         if path == '/api/videos':
-            body = json.dumps({'videos': [dict(r) for r in rows()]}, ensure_ascii=False).encode()
+            body = json.dumps({'videos': api_video_rows()}, ensure_ascii=False).encode()
             self.send_bytes(body, 'application/json; charset=utf-8')
             return
         if path.startswith('/thumb/') and path.endswith('.jpg'):

@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 import tempfile
@@ -6,7 +7,7 @@ import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
-from urllib import request
+from urllib import error, request
 
 import app
 
@@ -153,6 +154,97 @@ class PortalFeatureTests(unittest.TestCase):
         with app.con() as c:
             self.assertIsNotNone(c.execute("SELECT 1 FROM videos WHERE video_id=?", ("dQw4w9WgXcQ",)).fetchone())
 
+    def test_delete_video_rejects_active_downloads(self):
+        category = app.create_category("En curso")
+        for index, state in enumerate(("pending", "running")):
+            video_id = f"ACTIVE{index:05d}"
+            app.add_video_urls(category["id"], video_id)
+            with app.con() as c:
+                c.execute("UPDATE videos SET status=? WHERE video_id=?", (state, video_id))
+            with self.assertRaisesRegex(ValueError, "descarga"):
+                app.delete_video(video_id, delete_local=True)
+
+    def test_delete_video_does_not_race_with_queueing(self):
+        category = app.create_category("Carrera")
+        video_id = "RACE0000001"
+        app.add_video_urls(category["id"], video_id)
+        real_con = app.con
+
+        class InterleavedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, sql, params=()):
+                if sql.strip().upper().startswith("DELETE FROM VIDEOS"):
+                    with real_con() as other:
+                        other.execute("UPDATE videos SET status='pending' WHERE video_id=?", (video_id,))
+                return self.connection.execute(sql, params)
+
+        @contextlib.contextmanager
+        def interleaved_con():
+            with real_con() as connection:
+                yield InterleavedConnection(connection)
+
+        with patch.object(app, "con", interleaved_con):
+            with self.assertRaisesRegex(ValueError, "descarga"):
+                app.delete_video(video_id, delete_local=False)
+        with real_con() as connection:
+            self.assertEqual(
+                connection.execute("SELECT status FROM videos WHERE video_id=?", (video_id,)).fetchone()["status"],
+                "pending",
+            )
+
+    def test_delete_video_unlinks_a_symlink_without_following_it(self):
+        category = app.create_category("Enlace")
+        app.add_video_urls(category["id"], "dQw4w9WgXcQ")
+        outside = Path(self.tmp.name).parent / "objetivo-protegido.mp4"
+        outside.write_bytes(b"protegido")
+        self.addCleanup(lambda: outside.unlink(missing_ok=True))
+        link = app.VIDEOS / "enlace.mp4"
+        link.symlink_to(outside)
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=? WHERE video_id=?", (link.name, "dQw4w9WgXcQ"))
+        result = app.delete_video("dQw4w9WgXcQ", delete_local=True)
+        self.assertTrue(result["local_deleted"])
+        self.assertFalse(link.exists())
+        self.assertTrue(outside.is_file())
+
+    def test_delete_video_refuses_a_symlinked_library_root(self):
+        category = app.create_category("Raíz enlazada")
+        video_id = "ROOTLINK001"
+        app.add_video_urls(category["id"], video_id)
+        outside_dir = Path(self.tmp.name).parent / "yt-vault-protected-dir"
+        outside_dir.mkdir(exist_ok=True)
+        victim = outside_dir / "victim.mp4"
+        victim.write_bytes(b"protegido")
+        self.addCleanup(lambda: outside_dir.rmdir() if outside_dir.exists() else None)
+        self.addCleanup(lambda: victim.unlink(missing_ok=True))
+        linked_root = Path(self.tmp.name) / "videos-link"
+        try:
+            linked_root.symlink_to(outside_dir, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"El sistema no permite crear symlinks: {exc}")
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (victim.name, video_id))
+        with patch.object(app, "VIDEOS", linked_root):
+            result = app.delete_video(video_id, delete_local=True)
+        self.assertTrue(victim.is_file())
+        self.assertTrue(result["file_errors"])
+
+    def test_delete_video_reports_cleanup_errors_after_removing_the_record(self):
+        category = app.create_category("Error de disco")
+        app.add_video_urls(category["id"], "dQw4w9WgXcQ")
+        media = app.VIDEOS / "bloqueado.mp4"
+        media.write_bytes(b"video")
+        with app.con() as c:
+            c.execute("UPDATE videos SET filename=? WHERE video_id=?", (media.name, "dQw4w9WgXcQ"))
+        with patch.object(app, "_unlink_library_file", side_effect=OSError("disco ocupado")):
+            result = app.delete_video("dQw4w9WgXcQ", delete_local=True)
+        self.assertTrue(result["deleted"])
+        self.assertTrue(result["file_errors"])
+        with app.con() as c:
+            self.assertIsNone(c.execute("SELECT 1 FROM videos WHERE video_id=?", ("dQw4w9WgXcQ",)).fetchone())
+
     def test_queue_video_and_whole_category_skip_downloaded_items(self):
         category = app.create_category("Descargas")
         app.add_video_urls(category["id"], "dQw4w9WgXcQ\naqz-KE-bpKQ\nM7lc1UVf-VE")
@@ -181,6 +273,23 @@ class PortalFeatureTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row["name"], "Árabe 25/26")
         self.assertIn("Árabe 25/26", [c["name"] for c in app.list_categories()])
+
+    def test_init_repairs_an_orphan_legacy_category(self):
+        with app.con() as c:
+            c.execute(
+                "INSERT INTO videos(video_id,url,title,status,category_id,category) VALUES(?,?,?,?,?,?)",
+                ("dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ", "Vídeo legado", "done", 99999, "Curso legado"),
+            )
+        app.init()
+        with app.con() as c:
+            row = c.execute(
+                "SELECT v.category_id,c.name FROM videos v JOIN categories c ON c.id=v.category_id WHERE v.video_id=?",
+                ("dQw4w9WgXcQ",),
+            ).fetchone()
+            membership = c.execute("SELECT count(*) FROM video_categories WHERE video_id=?", ("dQw4w9WgXcQ",)).fetchone()[0]
+        self.assertEqual(row["name"], "Curso legado")
+        self.assertEqual(membership, 1)
+
     def test_frontend_exposes_management_forms_and_download_actions(self):
         category = app.create_category("Curso nuevo")
         app.add_video_urls(category["id"], "dQw4w9WgXcQ")
@@ -193,6 +302,7 @@ class PortalFeatureTests(unittest.TestCase):
         self.assertIn('id="videoManageDialog"', page)
         self.assertIn('id="deleteLocal"', page)
         self.assertIn('name="managed_categories"', page)
+        self.assertIn("file_errors.join('\\n')", page)
         self.assertIn(f'data-download-category="{category["id"]}"', page)
 
     def test_json_api_creates_adds_and_queues(self):
@@ -204,7 +314,10 @@ class PortalFeatureTests(unittest.TestCase):
             req = request.Request(
                 f'http://127.0.0.1:{server.server_port}{path}',
                 data=json.dumps(payload).encode(),
-                headers={'Content-Type': 'application/json'},
+                headers={
+                    'Content-Type': 'application/json',
+                    'Origin': f'http://127.0.0.1:{server.server_port}',
+                },
                 method='POST',
             )
             with request.urlopen(req, timeout=5) as response:
@@ -234,7 +347,10 @@ class PortalFeatureTests(unittest.TestCase):
             req = request.Request(
                 f'http://127.0.0.1:{server.server_port}{path}',
                 data=json.dumps(payload).encode(),
-                headers={'Content-Type': 'application/json'},
+                headers={
+                    'Content-Type': 'application/json',
+                    'Origin': f'http://127.0.0.1:{server.server_port}',
+                },
                 method='POST',
             )
             with request.urlopen(req, timeout=5) as response:
@@ -249,6 +365,79 @@ class PortalFeatureTests(unittest.TestCase):
                 'video_id': 'dQw4w9WgXcQ', 'delete_local': False,
             })
             self.assertEqual((status, deleted['deleted']), (200, True))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_json_api_returns_each_video_once_with_all_categories(self):
+        first = app.create_category("Primera")
+        second = app.create_category("Segunda")
+        app.add_video_urls(first["id"], "dQw4w9WgXcQ")
+        app.set_video_categories("dQw4w9WgXcQ", [first["id"], second["id"]])
+        server = ThreadingHTTPServer(('127.0.0.1', 0), app.H)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with request.urlopen(f'http://127.0.0.1:{server.server_port}/api/videos', timeout=5) as response:
+                payload = json.load(response)
+            self.assertEqual(len(payload["videos"]), 1)
+            self.assertEqual(payload["videos"][0]["category_ids"], [first["id"], second["id"]])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_mutating_api_rejects_non_json_and_cross_origin_requests(self):
+        server = ThreadingHTTPServer(('127.0.0.1', 0), app.H)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f'http://127.0.0.1:{server.server_port}/api/categories'
+        try:
+            plain = request.Request(url, data=b'{"name":"Ataque"}', headers={'Content-Type': 'text/plain'}, method='POST')
+            with self.assertRaises(error.HTTPError) as rejected_type:
+                request.urlopen(plain, timeout=5)
+            self.assertEqual(rejected_type.exception.code, 415)
+
+            foreign = request.Request(
+                url,
+                data=b'{"name":"Ataque"}',
+                headers={'Content-Type': 'application/json', 'Origin': 'https://sitio-ajeno.example'},
+                method='POST',
+            )
+            with self.assertRaises(error.HTTPError) as rejected_origin:
+                request.urlopen(foreign, timeout=5)
+            self.assertEqual(rejected_origin.exception.code, 403)
+
+            missing_origin = request.Request(
+                url,
+                data=b'{"name":"Sin origen"}',
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            with self.assertRaises(error.HTTPError) as rejected_missing_origin:
+                request.urlopen(missing_origin, timeout=5)
+            self.assertEqual(rejected_missing_origin.exception.code, 403)
+
+            wrong_scheme = request.Request(
+                url,
+                data=b'{"name":"Esquema incorrecto"}',
+                headers={
+                    'Content-Type': 'application/json',
+                    'Origin': f'https://127.0.0.1:{server.server_port}',
+                },
+                method='POST',
+            )
+            with self.assertRaises(error.HTTPError) as rejected_scheme:
+                request.urlopen(wrong_scheme, timeout=5)
+            self.assertEqual(rejected_scheme.exception.code, 403)
+
+            same_origin = request.Request(
+                url,
+                data=b'{"name":"Permitida"}',
+                headers={'Content-Type': 'application/json', 'Origin': f'http://127.0.0.1:{server.server_port}'},
+                method='POST',
+            )
+            with request.urlopen(same_origin, timeout=5) as accepted:
+                self.assertEqual(accepted.status, 201)
         finally:
             server.shutdown()
             server.server_close()

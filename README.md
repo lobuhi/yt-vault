@@ -107,7 +107,7 @@ Sin `systemd`, el descargador se ejecuta en un hilo de fondo dentro del proceso 
 5. Pulsa **Añadir a la videoteca**.
 6. Descarga un vídeo concreto o pulsa **Descargar toda la categoría**.
 
-Cada tarjeta incorpora **Organizar / borrar**. Desde ese diálogo puedes marcar varias categorías, mover el vídeo a otras categorías o eliminar su registro. La casilla **Eliminar también el archivo de vídeo y su miniatura del disco** está desmarcada de forma predeterminada y requiere una confirmación adicional antes del borrado.
+Cada tarjeta incorpora **Organizar / borrar**. Desde ese diálogo puedes marcar varias categorías, mover el vídeo a otras categorías o eliminar su registro. La casilla **Eliminar también el archivo de vídeo y su miniatura del disco** está desmarcada de forma predeterminada y requiere una confirmación adicional antes del borrado. Para evitar archivos huérfanos, no se permite borrar un vídeo mientras su descarga está pendiente o en curso.
 
 Añadir un vídeo al catálogo **no lo descarga automáticamente**. Solo se descargan filas encoladas explícitamente.
 

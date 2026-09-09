@@ -298,7 +298,9 @@ def _verified_library_root(root):
     if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & reparse_flag:
         raise OSError('El directorio de la videoteca es un enlace o punto de reanálisis no permitido.')
     resolved = absolute.resolve(strict=True)
-    if os.path.normcase(str(resolved)) != os.path.normcase(str(absolute)) or not absolute.is_dir():
+    if not absolute.is_dir():
+        raise OSError('El directorio de la videoteca no es una raíz segura.')
+    if os.name != 'nt' and os.path.normcase(str(resolved)) != os.path.normcase(str(absolute)):
         raise OSError('El directorio de la videoteca no es una raíz segura.')
     return absolute
 

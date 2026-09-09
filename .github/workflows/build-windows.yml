@@ -1,0 +1,77 @@
+name: Compilar para Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+
+      - name: Compilar VideotecaYouTube.exe
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --onefile `
+            --noconsole `
+            --clean `
+            --name VideotecaYouTube `
+            --hidden-import downloader `
+            --add-data "seed_urls.json;." `
+            app.py
+
+      - name: Descargar herramientas multimedia
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
+            -OutFile "dist/yt-dlp.exe"
+          Invoke-WebRequest `
+            -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
+            -OutFile "ffmpeg.zip"
+          Expand-Archive "ffmpeg.zip" -DestinationPath "ffmpeg-build"
+          $ffmpeg = Get-ChildItem "ffmpeg-build" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          if (-not $ffmpeg) { throw "No se encontró ffmpeg.exe en el paquete descargado" }
+          Copy-Item $ffmpeg.FullName "dist/ffmpeg.exe"
+
+      - name: Crear paquete portable
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "dist/VideotecaYouTube.exe", "dist/yt-dlp.exe", "dist/ffmpeg.exe" `
+            -DestinationPath "dist/VideotecaYouTube-Windows.zip"
+
+      - name: Guardar artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideotecaYouTube-Windows
+          path: |
+            dist/VideotecaYouTube.exe
+            dist/VideotecaYouTube-Windows.zip
+          if-no-files-found: error
+
+      - name: Publicar release para etiquetas
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/VideotecaYouTube.exe
+            dist/VideotecaYouTube-Windows.zip

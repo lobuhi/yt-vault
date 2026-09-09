@@ -136,7 +136,7 @@ class PortalFeatureTests(unittest.TestCase):
         with app.con() as c:
             c.execute("UPDATE videos SET filename=?, status='done' WHERE video_id=?", (media.name, "dQw4w9WgXcQ"))
         result = app.delete_video("dQw4w9WgXcQ", delete_local=True)
-        self.assertTrue(result["local_deleted"])
+        self.assertTrue(result["local_deleted"], result)
         self.assertFalse(media.exists())
         self.assertFalse(thumb.exists())
 
@@ -205,7 +205,7 @@ class PortalFeatureTests(unittest.TestCase):
         with app.con() as c:
             c.execute("UPDATE videos SET filename=? WHERE video_id=?", (link.name, "dQw4w9WgXcQ"))
         result = app.delete_video("dQw4w9WgXcQ", delete_local=True)
-        self.assertTrue(result["local_deleted"])
+        self.assertTrue(result["local_deleted"], result)
         self.assertFalse(link.exists())
         self.assertTrue(outside.is_file())
 
